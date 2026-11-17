@@ -1,0 +1,98 @@
+name: Sync TV main to Gitea
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-tv-main-to-gitea
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      github.repository == 'ivan-yurich/Yurich-Connect-Android-TV' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify and copy the committed TV main history
+        shell: bash
+        env:
+          TV_GITEA_DEPLOY_TOKEN: ${{ secrets.TV_GITEA_DEPLOY_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0
+          unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE
+
+          readonly source_url='https://github.com/ivan-yurich/Yurich-Connect-Android-TV.git'
+          readonly target_url='https://git.ivan-it.net/ivan-admin/Yurich-Connect-Android-TV.git'
+          readonly tv_root='1772b2e8dbdbb4dbaf037b2b6a5e34e277913d1e'
+          readonly main_ref='refs/heads/main'
+          readonly source_ref='refs/check/source'
+          readonly target_ref='refs/check/target'
+
+          fail() { printf '%s\n' "$*" >&2; exit 1; }
+          [[ -n "${TV_GITEA_DEPLOY_TOKEN:-}" ]] || fail 'Missing TV_GITEA_DEPLOY_TOKEN.'
+          auth="$(printf 'tv-main-sync:%s' "$TV_GITEA_DEPLOY_TOKEN" | base64 | tr -d '\r\n')"
+          unset TV_GITEA_DEPLOY_TOKEN
+
+          work="$(mktemp -d "$RUNNER_TEMP/tv-main-sync.XXXXXXXX")"
+          repo="$work/check.git"
+          git init --bare --quiet "$repo"
+
+          restricted_git() {
+            git -C "$repo" -c credential.helper= -c http.followRedirects=false \
+              -c push.followTags=false -c push.recurseSubmodules=no "$@"
+          }
+
+          target_git() (
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0="http.$target_url.extraHeader"
+            export GIT_CONFIG_VALUE_0="Authorization: Basic $auth"
+            restricted_git "$@"
+          )
+
+          restricted_git fetch --quiet --no-tags --no-recurse-submodules "$source_url" "$main_ref:$source_ref"
+          target_git fetch --quiet --no-tags --no-recurse-submodules "$target_url" "$main_ref:$target_ref"
+          source_sha="$(restricted_git rev-parse --verify "$source_ref^{commit}")"
+          target_sha="$(restricted_git rev-parse --verify "$target_ref^{commit}")"
+
+          restricted_git merge-base --is-ancestor "$tv_root" "$target_sha" ||
+            fail 'Gitea main is not descended from the reviewed TV root.'
+          restricted_git merge-base --is-ancestor "$target_sha" "$source_sha" ||
+            fail 'Gitea main is not an ancestor of GitHub main; refusing to overwrite it.'
+
+          # Git retains objects from intermediate commits, even when a later commit deletes an APK.
+          restricted_git rev-list "$target_sha..$source_sha" >"$work/commits"
+          while IFS= read -r commit; do
+            restricted_git ls-tree -r -z --name-only "$commit" >"$work/paths"
+            while IFS= read -r -d '' path; do
+              case "${path,,}" in
+                *.apk|*.aab|*.apks|*.apkm|*.xapk|*.idsig)
+                  fail "Blocked Android package in incoming commit $commit; nothing was pushed."
+                  ;;
+              esac
+            done <"$work/paths"
+          done <"$work/commits"
+
+          if [[ "$source_sha" == "$target_sha" ]]; then
+            printf 'TV main already matches: %s\n' "$source_sha"
+            exit 0
+          fi
+
+          # Refuse stale snapshots. The server also checks the update for a fast-forward.
+          current_source="$(restricted_git ls-remote --exit-code --refs "$source_url" "$main_ref")"
+          current_target="$(target_git ls-remote --exit-code --refs "$target_url" "$main_ref")"
+          [[ "$current_source" == "$source_sha"$'\t'"$main_ref" ]] || fail 'GitHub main changed during verification; retry.'
+          [[ "$current_target" == "$target_sha"$'\t'"$main_ref" ]] || fail 'Gitea main changed during verification; retry.'
+
+          target_git push --porcelain --no-follow-tags "$target_url" "$source_sha:$main_ref"
+          pushed_ref="$(target_git ls-remote --exit-code --refs "$target_url" "$main_ref")"
+          [[ "$pushed_ref" == "$source_sha"$'\t'"$main_ref" ]] || fail 'Gitea main read-back did not match the reviewed SHA.'
+          printf 'TV main verified on GitHub and Gitea: %s\n' "$source_sha"
