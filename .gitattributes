@@ -1,0 +1,19 @@
+* text=auto
+
+*.dart text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.cs text eol=crlf
+*.cpp text eol=crlf
+*.h text eol=crlf
+
+*.png binary
+*.ico binary
+*.dll binary
+*.exe binary
+*.zip binary
+
+plugins/flutter_singbox_vpn/android/src/main/assets/smart_route_android_candidates.json text eol=lf

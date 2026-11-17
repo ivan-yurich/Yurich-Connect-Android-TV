@@ -1,0 +1,420 @@
+import 'dart:convert';
+import 'dart:io';
+
+import '../models/dns_protection_mode.dart';
+import '../models/vpn_profile.dart';
+import '../tv_app_identity.dart';
+import 'profile_engine_selector.dart';
+import 'smart_route_rules.dart';
+import 'tls_pin_policy.dart';
+import 'vless_profile_validator.dart';
+
+enum SingBoxConfigTarget { android }
+
+enum NaiveOutboundMode { auto, native, httpConnect }
+
+class SingBoxConfigBuilder {
+  static const localMixedProxyPort = 20808;
+  static const _encryptedVlessRequiredMessage =
+      'VLESS без TLS/Reality не поддерживается.';
+  static const _remoteDnsTag = 'remote-dns-primary';
+  static const _localDnsTag = 'local-dns';
+  static const _tunIpv4Address = '172.19.0.1/30';
+  static const _tunIpv6Address = 'fdfe:dcba:9876::1/126';
+
+  String build(
+    VpnProfile profile, {
+    NaiveOutboundMode naiveMode = NaiveOutboundMode.auto,
+    bool smartRouteRuDirect = false,
+    List<String> smartRouteRuBypassPackages = const [],
+    DnsProtectionMode dnsProtectionMode = DnsProtectionMode.stable,
+  }) {
+    TlsPinPolicy.requireProfile(profile);
+    if (profile.kind == VpnProfileKind.singBoxConfig) {
+      final raw = profile.rawConfig;
+      if (raw == null || raw.trim().isEmpty) {
+        throw StateError('Пустой sing-box config.');
+      }
+      return _withHealthProxy(raw);
+    }
+
+    final outbound = profile.outbound;
+    if (outbound == null) {
+      throw StateError('У профиля нет outbound-конфига.');
+    }
+
+    final engine = ProfileEngineSelector.select(profile);
+    if (!engine.canRunInCurrentBuild ||
+        engine.engine != VpnCoreEngine.singBox) {
+      throw UnsupportedError(engine.reason);
+    }
+
+    final proxyOutbound =
+        jsonDecode(jsonEncode(outbound)) as Map<String, dynamic>;
+    if (profile.kind == VpnProfileKind.vlessTls &&
+        !VlessProfileValidator.hasEnabledTls(proxyOutbound)) {
+      throw UnsupportedError(_encryptedVlessRequiredMessage);
+    }
+    proxyOutbound['tag'] = 'proxy';
+    final useRemoteDns = usesRemoteDnsFor(profile.kind, dnsProtectionMode);
+    _normalizeOutbound(profile, proxyOutbound, naiveMode);
+    _applyDialStability(profile: profile, proxyOutbound: proxyOutbound);
+    final rejectUnsupportedUdp = profile.kind == VpnProfileKind.naive;
+
+    final config = <String, dynamic>{
+      'log': {'level': 'warn', 'timestamp': true},
+      'experimental': {
+        'cache_file': {
+          'enabled': true,
+          'path': 'cache.db',
+          'store_fakeip': true,
+        },
+      },
+      'dns': _dnsConfig(profile, useRemoteDns: useRemoteDns),
+      'inbounds': [
+        _tunInbound(
+          smartRouteRuDirect: smartRouteRuDirect,
+          smartRouteRuBypassPackages: smartRouteRuBypassPackages,
+        ),
+        _mixedInbound(),
+      ],
+      'outbounds': [
+        proxyOutbound,
+        {'type': 'direct', 'tag': 'direct'},
+      ],
+      'route': {
+        'rules': [
+          {'action': 'sniff'},
+          {
+            'type': 'logical',
+            'mode': 'or',
+            'rules': [
+              {'protocol': 'dns'},
+              {'port': 53},
+            ],
+            'action': 'hijack-dns',
+          },
+          _unsupportedUdpRule(rejectUnsupportedUdp),
+          // Local diagnostics must not follow Smart Route or private bypasses.
+          {
+            'inbound': ['mixed-in'],
+            'outbound': 'proxy',
+          },
+          if (smartRouteRuDirect) ..._smartRouteRules(),
+          {
+            'ip_cidr': ['198.18.0.0/15', 'fc00::/18'],
+            'outbound': 'proxy',
+          },
+          {'ip_is_private': true, 'outbound': 'direct'},
+        ],
+        'default_domain_resolver': useRemoteDns ? _remoteDnsTag : _localDnsTag,
+        'auto_detect_interface': true,
+        'final': 'proxy',
+      },
+    };
+
+    return jsonEncode(config);
+  }
+
+  String _withHealthProxy(String raw) {
+    final config = jsonDecode(raw) as Map<String, dynamic>;
+    _validateRawVlessOutbounds(config);
+    final inbounds = (config['inbounds'] as List? ?? const []).toList();
+    final existing = inbounds.whereType<Map>().where(
+      (inbound) => inbound['listen_port'] == localMixedProxyPort,
+    );
+    if (existing.isNotEmpty) {
+      if (existing.length != 1 ||
+          existing.single['type'] != 'mixed' ||
+          existing.single['listen'] != '127.0.0.1' ||
+          (existing.single['users'] as List? ?? const []).isNotEmpty) {
+        throw StateError(
+          'Порт $localMixedProxyPort нужен для локальной проверки VPN. '
+          'Измени конфликтующий inbound в JSON-конфиге.',
+        );
+      }
+      return raw;
+    }
+
+    final tags = inbounds
+        .whereType<Map>()
+        .map((inbound) => inbound['tag'])
+        .toSet();
+    var tag = 'yurich-health-in';
+    for (var suffix = 1; tags.contains(tag); suffix += 1) {
+      tag = 'yurich-health-in-$suffix';
+    }
+    inbounds.add({..._mixedInbound(), 'tag': tag});
+    config['inbounds'] = inbounds;
+    return jsonEncode(config);
+  }
+
+  void _validateRawVlessOutbounds(Map<String, dynamic> config) {
+    final outbounds = config['outbounds'];
+    if (outbounds is! List) {
+      return;
+    }
+
+    for (final item in outbounds.whereType<Map>()) {
+      final outbound = item.cast<String, dynamic>();
+      final type = outbound['type']?.toString().trim().toLowerCase();
+      if (type == 'vless') {
+        if (!VlessProfileValidator.hasEnabledTls(outbound)) {
+          throw UnsupportedError(_encryptedVlessRequiredMessage);
+        }
+        continue;
+      }
+
+      final protocol = outbound['protocol']?.toString().trim().toLowerCase();
+      if (protocol != 'vless') {
+        continue;
+      }
+      final streamSettings = outbound['streamSettings'];
+      final security = streamSettings is Map
+          ? streamSettings['security']?.toString().trim().toLowerCase()
+          : null;
+      if (security != 'tls' && security != 'reality') {
+        throw UnsupportedError(_encryptedVlessRequiredMessage);
+      }
+    }
+  }
+
+  Map<String, dynamic> _tunInbound({
+    required bool smartRouteRuDirect,
+    required List<String> smartRouteRuBypassPackages,
+  }) {
+    final inbound = <String, dynamic>{
+      'type': 'tun',
+      'tag': 'tun-in',
+      'address': [_tunIpv4Address, _tunIpv6Address],
+      'mtu': 1380,
+      'auto_route': true,
+      'strict_route': true,
+      'stack': 'gvisor',
+    };
+    inbound['interface_name'] = 'tun0';
+    inbound['exclude_package'] = [
+      TvAppIdentity.applicationId,
+      if (smartRouteRuDirect)
+        ...SmartRouteRules.ruBypassPackages(smartRouteRuBypassPackages),
+    ];
+    return inbound;
+  }
+
+  List<Map<String, dynamic>> _smartRouteRules() {
+    return [
+      _domainRoute(SmartRouteRules.proxyDomainRules, 'proxy'),
+      _domainRoute(SmartRouteRules.directDomainRules, 'direct'),
+    ];
+  }
+
+  Map<String, dynamic> _domainRoute(
+    SmartRouteDomainRules rules,
+    String outbound,
+  ) {
+    return {
+      if (rules.domains.isNotEmpty) 'domain': rules.domains,
+      if (rules.domainSuffixes.isNotEmpty)
+        'domain_suffix': rules.domainSuffixes,
+      'outbound': outbound,
+    };
+  }
+
+  Map<String, dynamic> _mixedInbound() {
+    return {
+      'type': 'mixed',
+      'tag': 'mixed-in',
+      'listen': '127.0.0.1',
+      'listen_port': localMixedProxyPort,
+    };
+  }
+
+  Map<String, dynamic> _dnsConfig(
+    VpnProfile profile, {
+    required bool useRemoteDns,
+  }) {
+    const remoteDnsServers = <Map<String, dynamic>>[
+      {
+        'type': 'https',
+        'tag': 'remote-dns-primary',
+        'server': '1.1.1.1',
+        'server_port': 443,
+        'path': '/dns-query',
+        'tls': {'enabled': true, 'server_name': 'cloudflare-dns.com'},
+        'detour': 'proxy',
+      },
+      {
+        'type': 'https',
+        'tag': 'remote-dns-secondary',
+        'server': '8.8.8.8',
+        'server_port': 443,
+        'path': '/dns-query',
+        'tls': {'enabled': true, 'server_name': 'dns.google'},
+        'detour': 'proxy',
+      },
+    ];
+    final servers = <Map<String, dynamic>>[
+      {'type': 'local', 'tag': _localDnsTag},
+      if (useRemoteDns) ...remoteDnsServers,
+      {
+        'type': 'fakeip',
+        'tag': 'fakeip',
+        'inet4_range': '198.18.0.0/15',
+        'inet6_range': 'fc00::/18',
+      },
+    ];
+
+    final rules = <Map<String, dynamic>>[];
+    final server = profile.server?.trim();
+    if (server != null && server.isNotEmpty && !_isIpLiteral(server)) {
+      rules.add({
+        'domain': [server],
+        'action': 'route',
+        'server': _localDnsTag,
+      });
+    }
+    rules.add({
+      'inbound': ['tun-in'],
+      'query_type': ['A', 'AAAA'],
+      'action': 'route',
+      'server': 'fakeip',
+    });
+    return {
+      'servers': servers,
+      'rules': rules,
+      'strategy': 'ipv4_only',
+      'cache_capacity': 8192,
+      'reverse_mapping': true,
+      'final': useRemoteDns ? _remoteDnsTag : _localDnsTag,
+    };
+  }
+
+  /// DNS policy for generated outbounds, independent of profile validation.
+  /// [build] checks engine support and handles raw configs before using it.
+  static bool usesRemoteDnsFor(
+    VpnProfileKind kind,
+    DnsProtectionMode dnsProtectionMode,
+  ) {
+    if (!dnsProtectionMode.protectsAgainstLeaks) {
+      return false;
+    }
+    return switch (kind) {
+      VpnProfileKind.hysteria ||
+      VpnProfileKind.hysteria2 ||
+      VpnProfileKind.vlessReality ||
+      VpnProfileKind.vlessTls => true,
+      VpnProfileKind.naive ||
+      VpnProfileKind.vlessXhttp ||
+      VpnProfileKind.vlessMkcp ||
+      VpnProfileKind.singBoxConfig => false,
+    };
+  }
+
+  bool _isIpLiteral(String value) => InternetAddress.tryParse(value) != null;
+
+  Map<String, dynamic> _unsupportedUdpRule(bool rejectAllUdp) {
+    return {
+      'type': 'logical',
+      'mode': 'or',
+      'rules': [
+        {'port': 853},
+        {'protocol': 'stun'},
+        {'protocol': 'icmp'},
+        if (rejectAllUdp) {'network': 'udp', 'port': 443},
+        if (rejectAllUdp) {'network': 'udp'},
+      ],
+      'action': 'reject',
+    };
+  }
+
+  void _applyDialStability({
+    required VpnProfile profile,
+    required Map<String, dynamic> proxyOutbound,
+  }) {
+    proxyOutbound.putIfAbsent('connect_timeout', () => '8s');
+    proxyOutbound.putIfAbsent('domain_resolver', () => _localDnsTag);
+    proxyOutbound.putIfAbsent('domain_strategy', () => 'ipv4_only');
+
+    final usesQuicTransport =
+        profile.kind == VpnProfileKind.hysteria2 ||
+        profile.kind == VpnProfileKind.hysteria;
+    if (usesQuicTransport) {
+      return;
+    }
+
+    proxyOutbound.putIfAbsent('tcp_keep_alive', () => '3m');
+    proxyOutbound.putIfAbsent('tcp_keep_alive_interval', () => '30s');
+    proxyOutbound.putIfAbsent('network_strategy', () => 'fallback');
+    proxyOutbound.putIfAbsent('fallback_delay', () => '200ms');
+  }
+
+  void _normalizeOutbound(
+    VpnProfile profile,
+    Map<String, dynamic> proxyOutbound,
+    NaiveOutboundMode naiveMode,
+  ) {
+    if (profile.kind == VpnProfileKind.vlessReality ||
+        profile.kind == VpnProfileKind.vlessTls) {
+      if (profile.kind == VpnProfileKind.vlessReality) {
+        final normalized = VlessProfileValidator.normalizeRealityTcpOutbound(
+          proxyOutbound,
+        );
+        proxyOutbound
+          ..clear()
+          ..addAll(normalized);
+        return;
+      }
+      if (proxyOutbound['network'] == 'tcp') {
+        proxyOutbound.remove('network');
+      }
+      proxyOutbound.putIfAbsent('packet_encoding', () => 'xudp');
+      return;
+    }
+
+    if (profile.kind != VpnProfileKind.naive) {
+      return;
+    }
+
+    final originalTls = (proxyOutbound['tls'] as Map?)?.cast<String, dynamic>();
+    final outboundType = (proxyOutbound['type'] as String?)?.toLowerCase();
+    final useHttpConnect =
+        naiveMode == NaiveOutboundMode.httpConnect ||
+        (naiveMode == NaiveOutboundMode.auto && outboundType == 'http');
+
+    if (!useHttpConnect) {
+      proxyOutbound['type'] = 'naive';
+      if (naiveMode == NaiveOutboundMode.native ||
+          naiveMode == NaiveOutboundMode.auto) {
+        proxyOutbound['quic'] = false;
+        proxyOutbound.remove('quic_congestion_control');
+      }
+    } else {
+      proxyOutbound['type'] = 'http';
+      proxyOutbound.remove('extra_headers');
+      proxyOutbound.remove('insecure_concurrency');
+      proxyOutbound.remove('quic');
+      proxyOutbound.remove('quic_congestion_control');
+      proxyOutbound.remove('udp_over_tcp');
+    }
+
+    final normalizedTls = <String, dynamic>{};
+    for (final key in const [
+      'server_name',
+      'certificate',
+      'certificate_path',
+      'ech',
+    ]) {
+      final value = originalTls?[key];
+      if (value != null) {
+        normalizedTls[key] = value;
+      }
+    }
+
+    normalizedTls['enabled'] = true;
+    normalizedTls.putIfAbsent(
+      'server_name',
+      () => profile.server ?? proxyOutbound['server'],
+    );
+    proxyOutbound['tls'] = normalizedTls;
+  }
+}

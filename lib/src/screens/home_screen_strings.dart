@@ -1,0 +1,1167 @@
+part of 'home_screen.dart';
+
+class _Strings {
+  String get homeTab => this == en ? 'Home' : 'Главная';
+  String get settingsTab => this == en ? 'Settings' : 'Настройки';
+  String get quickSettings =>
+      this == en ? 'Quick settings' : 'Быстрые настройки';
+  String get serversTitle => this == en ? 'Servers' : 'Серверы';
+  String get automaticServer => this == en ? 'Auto' : 'Авто';
+  String get automaticServerHint =>
+      this == en ? 'Chooses a working server' : 'Выбирает рабочий сервер';
+  String get choosingAutoServer =>
+      this == en ? 'Choosing a server…' : 'Выбираю сервер…';
+  String autoTryingServer(int current, int total) => this == en
+      ? 'Trying server $current of $total…'
+      : 'Пробую сервер $current из $total…';
+  String get autoWaitingForNetwork =>
+      this == en ? 'Waiting for internet…' : 'Жду интернет…';
+  String get autoNetworkWaitExpired => this == en
+      ? 'No internet. Check the network and try connecting again.'
+      : 'Нет интернета. Проверьте сеть и попробуйте подключиться снова.';
+  String get autoExhausted => this == en
+      ? 'Auto could not connect. Try again or choose a server manually.'
+      : 'Не удалось подключиться автоматически. Повторите попытку или выберите сервер вручную.';
+  String get noAutoServer => this == en
+      ? 'No suitable server for Auto. Choose one manually.'
+      : 'Для автовыбора нет подходящего сервера. Выберите вручную.';
+  String get unknownLocation =>
+      this == en ? 'Unknown location' : 'Локация неизвестна';
+  String get directLatencySetting =>
+      this == en ? 'Direct latency without VPN' : 'Прямой пинг без VPN';
+  String get workingVpnRequired => this == en
+      ? 'Connect to a working VPN first.'
+      : 'Для проверки нужен работающий VPN.';
+  String get directLatencyConsent => this == en
+      ? 'When VPN and Kill Switch are off, the app can measure latency from this device to servers in your profiles. Those servers will see your regular IP. No location access is used.'
+      : 'Когда VPN и Kill Switch выключены, приложение может измерить задержку от телефона до серверов в профилях. Эти серверы увидят ваш обычный IP. Доступ к геолокации не нужен.';
+  String get allowDirectLatency =>
+      this == en ? 'Allow measurement' : 'Разрешить замер';
+  String get withoutDirectLatency =>
+      this == en ? 'Without direct measurement' : 'Без прямого замера';
+  String get directLatencyUnavailable => this == en
+      ? 'No direct result. The network or server may not support the check.'
+      : 'Нет прямого замера. Сеть или сервер могли не ответить.';
+  String get directLatencyNotMeasured =>
+      this == en ? 'Not measured' : 'Не измерено';
+  String get directLatencySaveFailed => this == en
+      ? 'Could not save the preference. Direct checks are off for this session.'
+      : 'Настройка не сохранилась. Прямые замеры выключены в этом сеансе.';
+  String get directLatencySubtitle => this == en
+      ? 'Servers see your regular IP; unavailable with VPN or Kill Switch'
+      : 'Серверы видят обычный IP. Не работает при VPN или Kill Switch.';
+  String get probeHelp => this == en ? 'About latency' : 'О проверке пинга';
+  String get serverDetails => this == en ? 'Details' : 'Подробнее';
+  String get lastVpnFailure =>
+      this == en ? 'Last VPN failure' : 'Последний сбой VPN';
+  String get listActions =>
+      this == en ? 'Profile list actions' : 'Действия со списком';
+  String get subscriptionImportDescription => this == en
+      ? 'Paste a subscription link or a single VPN profile.'
+      : 'Вставьте ссылку на подписку или отдельный VPN-профиль.';
+  String get subscriptionInputLabel =>
+      this == en ? 'Link or profile' : 'Ссылка или профиль';
+  String get latencyMethods => this == en
+      ? 'Direct: TCP handshake to the server port, or ICMP echo to the host for UDP profiles when available. This is not a VPN login test. Without a direct result, Auto uses successful connection history.'
+      : 'Напрямую: время установки TCP до порта сервера или ICMP до хоста для UDP-профиля, если он отвечает. Это не проверка входа в VPN. Без прямого замера «Авто» использует историю успешных подключений.';
+
+  String directLatencyValue(
+    DirectLatencyReading reading, {
+    required bool cached,
+  }) {
+    final method = reading.kind == DirectLatencyKind.tcp ? 'TCP' : 'ICMP';
+    final suffix = this == en
+        ? (cached ? 'before VPN' : 'direct')
+        : (cached ? 'до VPN' : 'напрямую');
+    final unit = this == en ? 'ms' : 'мс';
+    return '$method ${reading.milliseconds} $unit · $suffix';
+  }
+
+  String vpnFailureMessage(String? category) => switch (category) {
+    'tls_certificate' || 'tls_handshake' =>
+      this == en
+          ? 'Server TLS verification failed.'
+          : 'Не удалось проверить защищённое соединение с сервером.',
+    'timeout' =>
+      this == en
+          ? 'The connection timed out.'
+          : 'Истекло время ожидания подключения.',
+    'dns_resolution' =>
+      this == en
+          ? 'The server address could not be resolved.'
+          : 'Не удалось определить адрес сервера.',
+    'network_unreachable' || 'connection_refused' || 'connection_reset' =>
+      this == en
+          ? 'The server did not complete the connection.'
+          : 'Сервер не завершил подключение.',
+    'permission' =>
+      this == en
+          ? 'Android did not grant VPN access.'
+          : 'Android не разрешил VPN-подключение.',
+    'configuration' || 'unsupported' =>
+      this == en
+          ? 'The VPN profile configuration was not accepted.'
+          : 'Не удалось применить настройки профиля.',
+    'unexpected_stop' => vpnStoppedUnexpectedly,
+    _ =>
+      this == en
+          ? 'Could not complete the VPN operation.'
+          : 'Не удалось выполнить операцию VPN.',
+  };
+  String get tapToConnect =>
+      this == en ? 'Tap to connect' : 'Нажмите для подключения';
+  String get connectAction => this == en ? 'Connect VPN' : 'Подключить VPN';
+  String get disconnectAction =>
+      this == en ? 'Disconnect VPN' : 'Отключить VPN';
+  String get cancelConnectionAction =>
+      this == en ? 'Cancel connection' : 'Отменить подключение';
+  String get activeServer => this == en ? 'Active server' : 'Активный сервер';
+  String get refreshServer => this == en ? 'Check server' : 'Проверить сервер';
+  String get appsDirect =>
+      this == en ? 'Apps that bypass VPN' : 'Приложения напрямую';
+  String get appsDirectHint =>
+      this == en ? 'Choices and status' : 'Выбор и статус';
+  String get smartRoutePaused =>
+      this == en ? 'Paused by Kill Switch' : 'Приостановлен Kill Switch';
+  String get appSettings =>
+      this == en ? 'App and support' : 'Приложение и поддержка';
+  String get appSettingsSubtitle =>
+      this == en ? 'Updates, language and help' : 'Обновления, язык и помощь';
+  String get batterySettingsTitle =>
+      this == en ? 'Background activity' : 'Работа в фоне';
+  String batterySettingsHint(bool? ignored) => ignored == true
+      ? this == en
+            ? 'Excluded from Android battery optimization'
+            : 'Исключено из оптимизации батареи Android'
+      : this == en
+      ? 'Open Yurich Connect app info → Battery'
+      : 'Карточка Yurich Connect → Батарея';
+  String get batterySettingsFallback => this == en
+      ? 'Open Android Settings → Apps → Yurich Connect → Battery.'
+      : 'Откройте Настройки Android → Приложения → Yurich Connect → Батарея.';
+  String get localIncidentTitle => this == en
+      ? 'Connection failures · local pilot'
+      : 'Сбои подключения · локальный пилот';
+  String localIncidentSummary(LocalIncidentState state) => state.enabled
+      ? const LocalConnectionIncidentsService().hermesDeliveryAvailable
+            ? this == en
+                  ? 'On this device: ${state.queued}. Sending requires separate permission.'
+                  : 'На телефоне: ${state.queued}. Для отправки нужно отдельное разрешение.'
+            : this == en
+            ? 'On this device: ${state.queued}. Nothing is sent.'
+            : 'На телефоне: ${state.queued}. Ничего не отправляется.'
+      : this == en
+      ? 'Off. Enable to keep a short history on this device only.'
+      : 'Выключено. Короткая история хранится только на телефоне.';
+  String get localIncidentConsent {
+    final delivery =
+        const LocalConnectionIncidentsService().hermesDeliveryAvailable;
+    return this == en
+        ? 'Keep one local entry when a connection still fails after retries. It contains a random report number, UTC minute, app version, protocol, network type, region and ingress categories (currently unknown), failure stage and code. No profile name, address, logs, tokens or device ID. Up to 50 entries; entries expire after 72 hours. Turning this off clears the queue. '
+              '${delivery ? 'This does not grant permission to send reports.' : 'Nothing is sent.'}'
+        : 'Сохранять одну локальную запись, если подключение не удалось и после повторов. В ней случайный номер отчёта, время UTC до минуты, версия приложения, протокол, тип сети, категории локации и входа (пока неизвестны), этап и код сбоя. Без имени профиля, адреса, логов, токенов и ID устройства. До 50 записей со сроком 72 часа. Выключение очищает очередь. '
+              '${delivery ? 'Это не даёт разрешения на отправку.' : 'Ничего не отправляется.'}';
+  }
+
+  String get localIncidentKeepOff =>
+      this == en ? 'Keep off' : 'Оставить выключенным';
+  String get localIncidentEnable =>
+      this == en ? 'Keep on this device' : 'Сохранять на телефоне';
+  String get localIncidentSaveFailed => this == en
+      ? 'Could not confirm the local history change. Recording is off for this session.'
+      : 'Не удалось подтвердить изменение истории. Запись выключена на этот сеанс.';
+  String get hermesPreviewTitle =>
+      this == en ? 'Yurich Report' : 'Отчёт Yurich';
+  String get hermesPreviewHint => this == en
+      ? 'Synthetic example only. Reports stay on this device; upload is unavailable.'
+      : 'Только пример. Отчёты остаются на телефоне, отправка недоступна.';
+  String get hermesPreviewUnavailable => this == en
+      ? 'Sample unavailable in this build.'
+      : 'Пример недоступен в этой сборке.';
+  String get moreServerActions =>
+      this == en ? 'Server actions' : 'Действия с сервером';
+  String get uploadLabel => this == en ? 'Upload' : 'Отправка';
+  String get downloadLabel => this == en ? 'Download' : 'Загрузка';
+  String get trafficTotalLabel =>
+      this == en ? 'Session traffic' : 'Трафик сессии';
+  String get durationLabel => this == en ? 'Session time' : 'Время сессии';
+
+  const _Strings._({
+    required this.addProfileHint,
+    required this.nothingToImport,
+    required this.supportedProtocolsOnly,
+    required this.switchingProfile,
+    required this.importFirst,
+    required this.autoConnectNoStableProfile,
+    required this.configSaveFailed,
+    required this.vpnStartFailed,
+    required this.connectionProbeFailed,
+    required this.disconnectingVpn,
+    required this.vpnStopServiceFailed,
+    required this.vpnStopped,
+    required this.profileDeleted,
+    required this.linkCopied,
+    required this.close,
+    required this.working,
+    required this.report,
+    required this.cannotOpenLink,
+    required this.mailSubject,
+    required this.mailFallback,
+    required this.vpnStoppedUnexpectedly,
+    required this.openLogsMessage,
+    required this.languageChanged,
+    required this.addSubscription,
+    required this.importHint,
+    required this.importAction,
+    required this.clipboard,
+    required this.scanQr,
+    required this.pasteFromClipboard,
+    required this.language,
+    required this.connected,
+    required this.connectionProblem,
+    required this.connecting,
+    required this.disconnecting,
+    required this.stopped,
+    required this.profiles,
+    required this.activeProfile,
+    required this.refreshPing,
+    required this.reachabilityInfo,
+    required this.collapseProfiles,
+    required this.serverPickerEmpty,
+    required this.autoConnectMode,
+    required this.openServers,
+    required this.hideServers,
+    required this.showQr,
+    required this.copy,
+    required this.delete,
+    required this.emptyProfiles,
+    required this.protocolLabel,
+    required this.networkLabel,
+    required this.dnsLabel,
+    required this.dnsCountryValue,
+    required this.dnsLeakGuardValue,
+    required this.dnsWarpValue,
+    required this.dnsLeakGuardEnabled,
+    required this.dnsLeakGuardDisabled,
+    required this.dnsLeakGuardApplying,
+    required this.smartRouteLabel,
+    required this.smartRouteEnabledValue,
+    required this.smartRouteDisabledValue,
+    required this.smartRouteEnabled,
+    required this.smartRouteDisabled,
+    required this.smartRouteApplying,
+    required this.stabilityLabel,
+    required this.stabilityValue,
+    required this.countryLabel,
+    required this.pingLabel,
+    required this.subscriptionLabel,
+    required this.subscriptionUnknown,
+    required this.subscriptionExpired,
+    required this.refreshSubscriptions,
+    required this.refreshingSubscriptions,
+    required this.noSubscriptionsToRefresh,
+    required this.subscriptionReminderTitle,
+    required this.mobileReady,
+    required this.mobileNetworkAdvice,
+    required this.androidVpnVisibleNote,
+    required this.endpointLabel,
+    required this.connect,
+    required this.disconnect,
+    required this.contact,
+    required this.support,
+    required this.donate,
+    required this.developer,
+    required this.updates,
+    required this.updateDescription,
+    required this.updateChannel,
+    required this.checkUpdates,
+    required this.updateChecking,
+    required this.updateInstallerOpened,
+    required this.updateInstallPermission,
+    required this.openSettings,
+    required this.faq,
+    required this.faqItems,
+    required this.logs,
+    required this.noLogs,
+    required this.notificationDescription,
+  });
+
+  final String addProfileHint;
+  final String nothingToImport;
+  final String supportedProtocolsOnly;
+  final String switchingProfile;
+  final String importFirst;
+  final String autoConnectNoStableProfile;
+  final String configSaveFailed;
+  final String vpnStartFailed;
+  final String connectionProbeFailed;
+  final String disconnectingVpn;
+  final String vpnStopServiceFailed;
+  final String vpnStopped;
+  final String profileDeleted;
+  final String linkCopied;
+  final String close;
+  final String working;
+  final String report;
+  final String cannotOpenLink;
+  final String mailSubject;
+  final String mailFallback;
+  final String vpnStoppedUnexpectedly;
+  final String openLogsMessage;
+  final String languageChanged;
+  final String addSubscription;
+  final String importHint;
+  final String importAction;
+  final String clipboard;
+  final String scanQr;
+  final String pasteFromClipboard;
+  final String language;
+  final String connected;
+  final String connectionProblem;
+  final String connecting;
+  final String disconnecting;
+  final String stopped;
+  final String profiles;
+  final String activeProfile;
+  final String refreshPing;
+  final String collapseProfiles;
+  final String serverPickerEmpty;
+  final String autoConnectMode;
+  final String openServers;
+  final String hideServers;
+  final String showQr;
+  final String copy;
+  final String delete;
+  final String emptyProfiles;
+  final String protocolLabel;
+  final String networkLabel;
+  final String dnsLabel;
+  final String dnsCountryValue;
+  final String dnsLeakGuardValue;
+  final String dnsWarpValue;
+  final String dnsLeakGuardEnabled;
+  final String dnsLeakGuardDisabled;
+  final String dnsLeakGuardApplying;
+  final String smartRouteLabel;
+  final String smartRouteEnabledValue;
+  final String smartRouteDisabledValue;
+  final String smartRouteEnabled;
+  final String smartRouteDisabled;
+  final String smartRouteApplying;
+  final String stabilityLabel;
+  final String stabilityValue;
+  final String countryLabel;
+  final String pingLabel;
+  final String reachabilityInfo;
+  final String subscriptionLabel;
+  final String subscriptionUnknown;
+  final String subscriptionExpired;
+  final String refreshSubscriptions;
+  final String refreshingSubscriptions;
+  final String noSubscriptionsToRefresh;
+  final String subscriptionReminderTitle;
+  final String mobileReady;
+  final String mobileNetworkAdvice;
+  final String androidVpnVisibleNote;
+  final String endpointLabel;
+  final String connect;
+  final String disconnect;
+  final String contact;
+  final String support;
+  final String donate;
+  final String developer;
+  final String updates;
+  final String updateDescription;
+  final String updateChannel;
+  final String checkUpdates;
+  final String updateChecking;
+  final String updateInstallerOpened;
+  final String updateInstallPermission;
+  final String openSettings;
+  final String faq;
+  final List<_FaqItem> faqItems;
+  final String logs;
+  final String noLogs;
+  final String notificationDescription;
+
+  static _Strings forLanguage(_AppLanguage language) {
+    return switch (language) {
+      _AppLanguage.en => en,
+      _ => ru,
+    };
+  }
+
+  String loadedProfiles(int count) => switch (this) {
+    _Strings.en => 'Profiles loaded: $count',
+    _ => 'Загружено профилей: $count',
+  };
+
+  String imported(int count) => switch (this) {
+    _Strings.en => 'Imported: $count',
+    _ => 'Импортировано: $count',
+  };
+
+  String importedProfiles(int count) => switch (this) {
+    _Strings.en => 'Profiles imported: $count',
+    _ => 'Импортировано профилей: $count',
+  };
+
+  String subscriptionsUpdated(int count) => switch (this) {
+    _Strings.en => 'Subscriptions updated: $count profiles',
+    _ => 'Подписки обновлены: $count профилей',
+  };
+
+  String subscriptionRefreshFailed(String error) => switch (this) {
+    _Strings.en => 'Subscription update failed: $error',
+    _ => 'Обновление подписок не удалось: $error',
+  };
+
+  String subscriptionReminderBody(String profileName, String status) =>
+      switch (this) {
+        _Strings.en => '$profileName: $status. Time to renew the subscription.',
+        _ => '$profileName: $status. Пора продлить подписку.',
+      };
+
+  String subscriptionReminderMany(
+    int count,
+    String profileName,
+    String status,
+  ) => switch (this) {
+    _Strings.en =>
+      '$count subscriptions need attention. First: $profileName, $status.',
+    _ => '$count подписки требуют внимания. Первая: $profileName, $status.',
+  };
+
+  String get profileStabilityGood => switch (this) {
+    _Strings.en => 'Stable',
+    _ => 'Стабильный',
+  };
+
+  String get profileStabilityLearning => switch (this) {
+    _Strings.en => 'Learning',
+    _ => 'Наблюдение',
+  };
+
+  String get profileStabilityWeak => switch (this) {
+    _Strings.en => 'Weak',
+    _ => 'Слабый',
+  };
+
+  String get profileStabilityCoolingDown => switch (this) {
+    _Strings.en => 'Cooling down',
+    _ => 'Остывает',
+  };
+
+  String get idleConnection => switch (this) {
+    _Strings.en => 'Idle',
+    _ => 'Ожидание',
+  };
+
+  String get reconnectingConnection => switch (this) {
+    _Strings.en => 'Reconnecting',
+    _ => 'Переподключение',
+  };
+
+  String supportTabLabel(_SupportTab tab) => switch (tab) {
+    _SupportTab.help => switch (this) {
+      _Strings.en => 'Help',
+      _ => 'Помощь',
+    },
+    _SupportTab.community => switch (this) {
+      _Strings.en => 'Project',
+      _ => 'Проект',
+    },
+  };
+
+  String selectedProfile(String name) => switch (this) {
+    _Strings.en => 'Selected profile: $name',
+    _ => 'Выбран профиль: $name',
+  };
+
+  String serverPickerTitle(int count) => switch (this) {
+    _Strings.en => 'Servers: $count',
+    _ => 'Серверы: $count',
+  };
+
+  String connectingTo(String name) => switch (this) {
+    _Strings.en => 'Connecting to $name...',
+    _ => 'Подключаю $name...',
+  };
+
+  String connectingStatus(String name) => switch (this) {
+    _Strings.en => 'Connecting: $name',
+    _ => 'Подключаюсь: $name',
+  };
+
+  String connectionProfile(String name) => switch (this) {
+    _Strings.en => 'Connection: $name',
+    _ => 'Подключение: $name',
+  };
+
+  HomeProfileLabels get _profileLabels =>
+      this == en ? HomeProfileLabels.en : HomeProfileLabels.ru;
+
+  String unsupportedProtocol(VpnProfileKind kind) =>
+      _profileLabels.unsupportedProtocol(kind);
+
+  String vpnNotConnected(String status) => switch (this) {
+    _Strings.en => 'VPN did not reach Connected. Last status: $status.',
+    _ => 'VPN не вышел в статус "Подключено". Последний статус: $status.',
+  };
+
+  String vpnStopTimeout(String status) => switch (this) {
+    _Strings.en => 'VPN did not fully stop in time. Last status: $status.',
+    _ => 'VPN не успел полностью остановиться. Последний статус: $status.',
+  };
+
+  String updateIdle(String version) => switch (this) {
+    _Strings.en => 'Installed version: $version',
+    _ => 'Установлена версия: $version',
+  };
+
+  String get playUpdateDescription => switch (this) {
+    _Strings.en =>
+      'This build receives signed updates only through Google Play. The app does not download or install APK files.',
+    _ =>
+      'Эта сборка получает подписанные обновления только через Google Play. Приложение не скачивает и не устанавливает APK-файлы.',
+  };
+
+  String get playUpdateChannel => switch (this) {
+    _Strings.en => 'Update channel: Google Play',
+    _ => 'Канал обновлений: Google Play',
+  };
+
+  String get openGooglePlay => switch (this) {
+    _Strings.en => 'Open Google Play',
+    _ => 'Открыть Google Play',
+  };
+
+  String get playUpdatesOnly => switch (this) {
+    _Strings.en => 'Play builds are updated through Google Play.',
+    _ => 'Обновления Play-сборки устанавливаются через Google Play.',
+  };
+
+  String get soakUpdateDescription => switch (this) {
+    _Strings.en =>
+      'This internal build is intended for long-running QA. Automatic app updates are disabled to keep test results reproducible.',
+    _ =>
+      'Эта внутренняя сборка предназначена для длительных QA-тестов. Автообновления отключены, чтобы результаты теста оставались воспроизводимыми.',
+  };
+
+  String get soakUpdateChannel => switch (this) {
+    _Strings.en => 'Update channel: soak test',
+    _ => 'Канал обновлений: тестовый soak',
+  };
+
+  String get soakUpdatesDisabled => switch (this) {
+    _Strings.en => 'Updates are disabled in the soak test build.',
+    _ => 'В тестовой soak-сборке обновления отключены.',
+  };
+
+  String get unknownUpdateDescription => switch (this) {
+    _Strings.en =>
+      'The app could not determine its update channel. Retry after the app finishes starting.',
+    _ =>
+      'Приложение не смогло определить канал обновлений. Повтори проверку после завершения запуска.',
+  };
+
+  String get unknownUpdateChannel => switch (this) {
+    _Strings.en => 'Update channel: detecting...',
+    _ => 'Канал обновлений: определяется...',
+  };
+
+  String get updateChannelUnavailable => switch (this) {
+    _Strings.en => 'The update channel is temporarily unavailable.',
+    _ => 'Канал обновлений временно недоступен.',
+  };
+
+  String get updateCheckTimedOut => switch (this) {
+    _Strings.en => 'The update request timed out. Check the network and retry.',
+    _ => 'Превышено время ожидания обновления. Проверь сеть и повтори попытку.',
+  };
+
+  String get updateArchitectureUnavailable => switch (this) {
+    _Strings.en =>
+      'Unable to determine the phone CPU architecture. Restart the app and retry. Update availability was not checked.',
+    _ =>
+      'Не удалось определить архитектуру телефона. Перезапусти приложение и повтори попытку. Наличие обновления не проверено.',
+  };
+
+  String get updatesDisabled => switch (this) {
+    _Strings.en => 'Updates disabled',
+    _ => 'Обновления отключены',
+  };
+
+  String get retry => switch (this) {
+    _Strings.en => 'Retry',
+    _ => 'Повторить',
+  };
+
+  String updateAvailable(String version) => switch (this) {
+    _Strings.en => 'New version available: $version',
+    _ => 'Доступна новая версия: $version',
+  };
+
+  String updateAvailableSnack(String version) => switch (this) {
+    _Strings.en => 'Yurich Connect $version is available.',
+    _ => 'Вышла новая версия Yurich Connect $version.',
+  };
+
+  String get updateAvailableTitle => switch (this) {
+    _Strings.en => 'Yurich Connect update',
+    _ => 'Обновление Yurich Connect',
+  };
+
+  String get testingUpdateChannel => switch (this) {
+    _Strings.en => 'Update channel: GitHub / Testing',
+    _ => 'Канал обновлений: GitHub / Тестовый',
+  };
+
+  String updateAvailableBody(String version) => switch (this) {
+    _Strings.en => 'Version $version is ready. Open Updates to install it.',
+    _ => 'Версия $version готова. Открой обновления и установи её.',
+  };
+
+  String get updateNow => switch (this) {
+    _Strings.en => 'Update',
+    _ => 'Обновить',
+  };
+
+  String get downloadApk => switch (this) {
+    _Strings.en => 'APK',
+    _ => 'APK',
+  };
+
+  String updateNoUpdates(String version) => switch (this) {
+    _Strings.en => 'Version $version is current.',
+    _ => 'Версия $version актуальна.',
+  };
+
+  String updateDownloading(String version) => switch (this) {
+    _Strings.en => 'Downloading version $version...',
+    _ => 'Скачиваю версию $version...',
+  };
+
+  String updateDownloadingProgress(String version, int percent) =>
+      switch (this) {
+        _Strings.en => 'Downloading version $version: $percent%',
+        _ => 'Скачиваю версию $version: $percent%',
+      };
+
+  String updateInstalling(String version) => switch (this) {
+    _Strings.en => 'Version $version downloaded. Opening installer...',
+    _ => 'Версия $version скачана. Открываю установщик...',
+  };
+
+  String updateFailed(String error) => switch (this) {
+    _Strings.en => 'Update failed: $error',
+    _ => 'Обновление не удалось: $error',
+  };
+
+  String subscriptionStatus(DateTime? expiresAt) =>
+      _profileLabels.subscriptionStatus(expiresAt, now: DateTime.now());
+
+  static const ru = _Strings._(
+    addProfileHint: 'Добавь подписку Remnawave, QR или отдельный ключ',
+    nothingToImport: 'Нечего импортировать.',
+    supportedProtocolsOnly:
+        'В этой сборке запускаются Reality, NaiveProxy, Hysteria2 и XHTTP через встроенные sing-box и Xray.',
+    switchingProfile: 'Переключаю профиль...',
+    importFirst: 'Сначала импортируй профиль.',
+    autoConnectNoStableProfile:
+        'Для авто-подключения нужен рабочий Reality или NaiveProxy профиль. Hysteria не запускается автоматически.',
+    configSaveFailed: 'sing-box не сохранил config.',
+    vpnStartFailed: 'VPN не стартовал. Открой логи ниже.',
+    connectionProbeFailed:
+        'VPN запустился, но проверка интернета через туннель не прошла.',
+    disconnectingVpn: 'Отключаю VPN...',
+    vpnStopServiceFailed: 'VPN-сервис не смог полностью остановиться.',
+    vpnStopped: 'VPN остановлен',
+    profileDeleted: 'Профиль удалён',
+    linkCopied: 'Ссылка скопирована',
+    close: 'Закрыть',
+    working: 'Работаю...',
+    report: 'Отчёт',
+    cannotOpenLink: 'Не смог открыть ссылку.',
+    mailSubject: 'Yurich Connect: диагностика VPN',
+    mailFallback: 'Почта не открылась. Отчёт скопирован в буфер.',
+    vpnStoppedUnexpectedly: 'VPN остановлен неожиданно',
+    openLogsMessage: 'VPN остановлен. Открой логи sing-box.',
+    languageChanged: 'Язык переключён',
+    addSubscription: 'Добавить подписку',
+    importHint: 'https://…',
+    importAction: 'Добавить',
+    clipboard: 'Из буфера',
+    scanQr: 'Сканировать QR',
+    pasteFromClipboard: 'Вставить из буфера',
+    language: 'Язык',
+    connected: 'Подключено',
+    connectionProblem: 'Нет стабильного соединения',
+    connecting: 'Подключаюсь',
+    disconnecting: 'Отключаюсь',
+    stopped: 'Остановлено',
+    profiles: 'Профили',
+    activeProfile: 'Активен',
+    refreshPing: 'Проверить серверы через текущий VPN',
+    reachabilityInfo:
+        'Задержка измеряется через текущий VPN, не напрямую. TLS подтверждает ответ сервера, но не работу его VPN-протокола. Для UDP нужна проверка подключением.',
+    collapseProfiles: 'Свернуть список',
+    serverPickerEmpty: 'Сервер не выбран',
+    autoConnectMode: 'Автовыбор Reality/NaiveProxy, Hysteria вручную',
+    openServers: 'Открыть',
+    hideServers: 'Скрыть',
+    showQr: 'Показать QR',
+    copy: 'Скопировать',
+    delete: 'Удалить',
+    emptyProfiles:
+        'Пока нет профилей. Нажми +, вставь подписку или сканируй QR.',
+    protocolLabel: 'Протокол',
+    networkLabel: 'Сеть',
+    dnsLabel: 'DNS',
+    dnsCountryValue: 'Auto resolver',
+    dnsLeakGuardValue: 'Auto DNS',
+    dnsWarpValue: 'WARP',
+    dnsLeakGuardEnabled: 'Auto DNS включён',
+    dnsLeakGuardDisabled: 'Auto DNS выключен',
+    dnsLeakGuardApplying: 'Применяю Auto DNS...',
+    smartRouteLabel: 'Smart Route',
+    smartRouteEnabledValue: 'Известные RU напрямую / остальные VPN',
+    smartRouteDisabledValue: 'Всё через VPN',
+    smartRouteEnabled: 'Smart Route включён',
+    smartRouteDisabled: 'Smart Route выключен',
+    smartRouteApplying: 'Применяю Smart Route...',
+    stabilityLabel: 'Стабильность',
+    stabilityValue: 'Фоновый keeper',
+    countryLabel: 'Страна',
+    pingLabel: 'Проверка через VPN',
+    subscriptionLabel: 'Подписка',
+    subscriptionUnknown: 'Срок не указан',
+    subscriptionExpired: 'Истекла',
+    refreshSubscriptions: 'Обновить подписки',
+    refreshingSubscriptions: 'Обновляю подписки...',
+    noSubscriptionsToRefresh:
+        'Не нашёл исходную ссылку подписки. Вставь https://.../s/... или https://.../links.txt один раз.',
+    subscriptionReminderTitle: 'Пора продлить подписку',
+    mobileReady: 'Wi‑Fi / LTE',
+    mobileNetworkAdvice:
+        'Wi‑Fi/LTE: строгий TUN, FakeIP и фоновый keeper; туннель перепроверяется без открытия приложения.',
+    androidVpnVisibleNote:
+        'Android может показать приложениям факт VPN. Yurich Connect защищает IP/DNS, но системный VpnService не скрывается без root/прошивки.',
+    endpointLabel: 'Сервер',
+    connect: 'Подключить',
+    disconnect: 'Отключить',
+    contact: 'Связь',
+    support: 'Поддержка',
+    donate: 'Донат',
+    developer: 'Разработчику',
+    updates: 'Обновления',
+    updateDescription:
+        'Приложение само проверит свежий APK, выберет файл под телефон и откроет установщик Android. Переходить на страницу релиза не нужно.',
+    updateChannel: 'Канал обновлений: GitHub Releases',
+    checkUpdates: 'Проверить и установить',
+    updateChecking: 'Проверяю обновления...',
+    updateInstallerOpened: 'Установщик Android открыт',
+    updateInstallPermission:
+        'Разреши установку приложений из Yurich Connect и нажми кнопку ещё раз.',
+    openSettings: 'Настройки',
+    faq: 'FAQ',
+    faqItems: [
+      _FaqItem(
+        question: 'Как добавить подписку или ключ?',
+        answer:
+            'Нажми + в разделе профилей. Можно вставить ссылку вручную, из буфера или отсканировать QR.',
+      ),
+      _FaqItem(
+        question: 'Наши протоколы',
+        answer:
+            'Название в приложении -> технология -> транспорт\n\n'
+            'NaiveProxy -> HTTPS / TCP\n'
+            'Hysteria2 -> QUIC / UDP\n'
+            'Reality -> VLESS Reality Vision -> TCP/443\n'
+            'XHTTP -> VLESS XHTTP -> TLS или Reality + HTTP/2/443',
+      ),
+      _FaqItem(
+        question: 'NaiveProxy — HTTPS',
+        answer:
+            'Работает как обычное защищённое HTTPS-соединение через Caddy.\n\n'
+            '• Ссылка: naive+https://\n'
+            '• Хорошая совместимость с Wi-Fi и мобильными операторами.\n'
+            '• Трафик похож на обычный веб-браузер.\n'
+            '• Надёжный запасной вариант, если Reality не работает.\n'
+            '• В приложении находится в разделе NaiveProxy.',
+      ),
+      _FaqItem(
+        question: 'Hysteria2 — QUIC',
+        answer:
+            'Использует QUIC поверх UDP. Hysteria и Hysteria2 — разные версии протокола; версия указана у профиля.\n\n'
+            '• Ссылка: hy2://\n'
+            '• Скорость зависит от сервера и качества сети.\n'
+            '• Подходит для видео и загрузок, если сеть разрешает UDP.\n'
+            '• Может не работать в сетях, где оператор блокирует UDP.\n'
+            '• В приложении находится в разделе Hysteria.',
+      ),
+      _FaqItem(
+        question: 'Reality — VLESS Reality',
+        answer:
+            'Основной лёгкий протокол Xray. Имитирует настоящее TLS-соединение без отдельного сертификата Reality.\n\n'
+            '• Ссылка: vless://\n'
+            '• Параметры: security=reality, type=tcp, flow=xtls-rprx-vision.\n'
+            '• Работает через TCP/443.\n'
+            '• HAProxy по SNI направляет соединение в Xray.\n'
+            '• Хороший баланс скорости, стабильности и маскировки.\n'
+            '• В приложении находится в разделе VLESS.',
+      ),
+      _FaqItem(
+        question: 'XHTTP — VLESS XHTTP',
+        answer:
+            'VLESS передаётся внутри трафика, похожего на обычные HTTP-запросы.\n\n'
+            '• Ссылка: vless://\n'
+            '• Транспорт: type=xhttp, обычно mode=packet-up.\n'
+            '• Путь профиля обычно /xhttp.\n'
+            '• Защита задаётся профилем: security=tls или security=reality.\n'
+            '• Работает через порт 443; для TLS-профилей используется HTTP/2.\n'
+            '• Запускается встроенным современным Xray-ядром.\n'
+            '• Сейчас XHTTP доступен на Finland и отдельной локации Poland 2.',
+      ),
+      _FaqItem(
+        question: 'Какой протокол выбирать?',
+        answer:
+            '• Основной вариант: Reality.\n'
+            '• Сеть с доступным UDP: можно проверить Hysteria2.\n'
+            '• Совместимость через HTTPS: NaiveProxy.\n'
+            '• Дополнительный современный вариант: XHTTP.\n\n'
+            'Если сеть блокирует UDP, вместо Hysteria2 выбери Reality или NaiveProxy. Ни один протокол не гарантирует стабильность в любой сети. HAProxy, Caddy, DNS, WARP и Smart Route — не клиентские протоколы: они отвечают за распределение соединений, маскировку, DNS и маршрутизацию.',
+      ),
+      _FaqItem(
+        question: 'Как работает Smart Route?',
+        answer:
+            'Smart Route разделяет трафик: известные российские сервисы и приложения идут напрямую, а зарубежные и неизвестные направления — через VPN, включая неизвестные сайты .ru/.su/.рф. Банки, Госуслуги, Яндекс, VK и маркетплейсы из встроенного списка могут работать напрямую; ChatGPT, Google, YouTube, Telegram и другие глобальные сервисы остаются в VPN. Браузеры целиком не исключаются из VPN: отдельные известные домены могут идти напрямую. При прямом маршруте сервис видит IP оператора.',
+      ),
+      _FaqItem(
+        question: 'Как включить и проверить Smart Route?',
+        answer:
+            '1. Открой «Настройки» (шестерёнка).\n'
+            '2. Включи Smart Route. При активном VPN приложение выполнит короткое переподключение.\n'
+            '3. Проверь известный российский сервис и отдельно открой зарубежный сайт или неизвестный сайт .ru. Последние должны видеть IP VPN; сервис из прямого списка — IP оператора.\n'
+            '4. Если нужный сервис маршрутизируется неверно, временно выключи Smart Route и отправь отчёт разработчику.\n\n'
+            'Выключенный Smart Route направляет весь обычный трафик через VPN.',
+      ),
+      _FaqItem(
+        question: 'Как работает Auto DNS?',
+        answer:
+            'Auto DNS перехватывает DNS-запросы внутри TUN и защищает их от подмены оператором. Для Reality, Hysteria2 и XHTTP используются защищённые резолверы Cloudflare и Google через туннель. NaiveProxy сохраняет локальный bootstrap DNS ради совместимости и стабильного поиска адреса сервера — это осознанный компромисс этого режима.',
+      ),
+      _FaqItem(
+        question: 'Как включить и проверить Auto DNS?',
+        answer:
+            '1. Открой «Настройки» (шестерёнка) и найди строку DNS.\n'
+            '2. Включи Auto DNS, если переключатель доступен. При активном VPN приложение выполнит короткое переподключение.\n'
+            '3. На LTE и публичном Wi-Fi рекомендуется держать Auto DNS включённым.\n'
+            '4. Если Wi-Fi требует входа через captive portal, временно выключи VPN или Auto DNS, авторизуйся в сети и включи защиту снова.\n'
+            '5. Для проверки открой DNS leak test после подключения: для Reality, Hysteria2 и XHTTP нормальны резолверы Cloudflare или Google.\n\n'
+            'Auto DNS не меняет страну VPN и не заменяет Smart Route.',
+      ),
+      _FaqItem(
+        question: 'Что делать, если после смены профиля пропал интернет?',
+        answer:
+            'Нажми Отключить, подожди статус Остановлено и подключи профиль снова. Если проблема повторяется, отправь отчёт разработчику.',
+      ),
+      _FaqItem(
+        question: 'Почему нужна шторка уведомления?',
+        answer:
+            'Android требует постоянное уведомление для VPN. Разреши уведомления, чтобы видеть статус и скорость в шторке.',
+      ),
+      _FaqItem(
+        question: 'Почему теперь лучше работает мобильная сеть?',
+        answer:
+            'Приложение использует единый сетевой режим для Wi‑Fi и LTE: аккуратное переподключение, строгий TUN и устойчивую маршрутизацию через туннель.',
+      ),
+      _FaqItem(
+        question: 'Безопасно ли отправлять отчёт?',
+        answer:
+            'Отчёт открывается в твоей почте перед отправкой. Пароли, UUID и ключи скрываются автоматически.',
+      ),
+    ],
+    logs: 'Логи и диагностика',
+    noLogs: 'Логов пока нет.',
+    notificationDescription: 'VPN подключение активно',
+  );
+
+  static const en = _Strings._(
+    addProfileHint: 'Add a Remnawave subscription, QR code, or single key',
+    nothingToImport: 'Nothing to import.',
+    supportedProtocolsOnly:
+        'This build runs Reality, NaiveProxy, Hysteria2, and XHTTP through the bundled sing-box and Xray cores.',
+    switchingProfile: 'Switching profile...',
+    importFirst: 'Import a profile first.',
+    autoConnectNoStableProfile:
+        'Auto connect needs a working Reality or NaiveProxy profile. Hysteria is not started automatically.',
+    configSaveFailed: 'sing-box did not save the config.',
+    vpnStartFailed: 'VPN did not start. Check the logs below.',
+    connectionProbeFailed:
+        'VPN started, but the tunnel internet probe did not pass.',
+    disconnectingVpn: 'Disconnecting VPN...',
+    vpnStopServiceFailed: 'VPN service could not fully stop.',
+    vpnStopped: 'VPN stopped',
+    profileDeleted: 'Profile deleted',
+    linkCopied: 'Link copied',
+    close: 'Close',
+    working: 'Working...',
+    report: 'Report',
+    cannotOpenLink: 'Could not open the link.',
+    mailSubject: 'Yurich Connect: VPN diagnostics',
+    mailFallback: 'Mail did not open. Report copied to clipboard.',
+    vpnStoppedUnexpectedly: 'VPN stopped unexpectedly',
+    openLogsMessage: 'VPN stopped. Open sing-box logs.',
+    languageChanged: 'Language changed',
+    addSubscription: 'Add subscription',
+    importHint: 'https://…',
+    importAction: 'Add',
+    clipboard: 'From clipboard',
+    scanQr: 'Scan QR',
+    pasteFromClipboard: 'Paste from clipboard',
+    language: 'Language',
+    connected: 'Connected',
+    connectionProblem: 'Connection problem',
+    connecting: 'Connecting',
+    disconnecting: 'Disconnecting',
+    stopped: 'Stopped',
+    profiles: 'Profiles',
+    activeProfile: 'Active',
+    refreshPing: 'Check servers through current VPN',
+    reachabilityInfo:
+        'Latency is measured through the current VPN, not directly. TLS confirms a server response, not its VPN credentials. UDP requires a connection test.',
+    collapseProfiles: 'Collapse list',
+    serverPickerEmpty: 'No server selected',
+    autoConnectMode: 'Auto selects Reality/NaiveProxy; Hysteria is manual only',
+    openServers: 'Open',
+    hideServers: 'Hide',
+    showQr: 'Show QR',
+    copy: 'Copy',
+    delete: 'Delete',
+    emptyProfiles: 'No profiles yet. Tap +, paste a subscription, or scan QR.',
+    protocolLabel: 'Protocol',
+    networkLabel: 'Network',
+    dnsLabel: 'DNS',
+    dnsCountryValue: 'Auto resolver',
+    dnsLeakGuardValue: 'Auto DNS',
+    dnsWarpValue: 'WARP',
+    dnsLeakGuardEnabled: 'Auto DNS enabled',
+    dnsLeakGuardDisabled: 'Auto DNS disabled',
+    dnsLeakGuardApplying: 'Applying Auto DNS...',
+    smartRouteLabel: 'Smart Route',
+    smartRouteEnabledValue: 'Known RU direct / others VPN',
+    smartRouteDisabledValue: 'All traffic through VPN',
+    smartRouteEnabled: 'Smart Route enabled',
+    smartRouteDisabled: 'Smart Route disabled',
+    smartRouteApplying: 'Applying Smart Route...',
+    stabilityLabel: 'Stability',
+    stabilityValue: 'Background keeper',
+    countryLabel: 'Country',
+    pingLabel: 'Check through VPN',
+    subscriptionLabel: 'Subscription',
+    subscriptionUnknown: 'Not provided',
+    subscriptionExpired: 'Expired',
+    refreshSubscriptions: 'Refresh subscriptions',
+    refreshingSubscriptions: 'Refreshing subscriptions...',
+    noSubscriptionsToRefresh:
+        'No saved subscription source. Paste the https://.../s/... or https://.../links.txt URL once.',
+    subscriptionReminderTitle: 'Subscription renewal',
+    mobileReady: 'Wi‑Fi / LTE',
+    mobileNetworkAdvice:
+        'Wi-Fi/LTE: strict TUN, FakeIP, and a background keeper that checks the tunnel without opening the app.',
+    androidVpnVisibleNote:
+        'Android can expose VPN status to apps. Yurich Connect protects IP/DNS, but system VpnService cannot be hidden without root/custom firmware.',
+    endpointLabel: 'Server',
+    connect: 'Connect',
+    disconnect: 'Disconnect',
+    contact: 'Contact',
+    support: 'Support',
+    donate: 'Donate',
+    developer: 'Developer',
+    updates: 'Updates',
+    updateDescription:
+        'The app checks for a fresh APK, picks the right file for this phone, and opens the Android installer. No release page is opened.',
+    updateChannel: 'Update channel: GitHub Releases',
+    checkUpdates: 'Check and install',
+    updateChecking: 'Checking updates...',
+    updateInstallerOpened: 'Android installer opened',
+    updateInstallPermission:
+        'Allow app installs from Yurich Connect, then press the button again.',
+    openSettings: 'Settings',
+    faq: 'FAQ',
+    faqItems: [
+      _FaqItem(
+        question: 'How do I add a subscription or key?',
+        answer:
+            'Use the add button in Profiles. You can paste manually, import from clipboard, or scan a QR code.',
+      ),
+      _FaqItem(
+        question: 'Our protocols',
+        answer:
+            'App name -> technology -> transport\n\n'
+            'NaiveProxy -> HTTPS / TCP\n'
+            'Hysteria2 -> QUIC / UDP\n'
+            'Reality -> VLESS Reality Vision -> TCP/443\n'
+            'XHTTP -> VLESS XHTTP -> TLS or Reality + HTTP/2/443',
+      ),
+      _FaqItem(
+        question: 'NaiveProxy — HTTPS',
+        answer:
+            'Works like a regular secure HTTPS connection through Caddy.\n\n'
+            '• Link: naive+https://\n'
+            '• Strong compatibility with Wi-Fi and mobile operators.\n'
+            '• Traffic resembles a normal web browser.\n'
+            '• A reliable fallback when Reality does not work.\n'
+            '• Shown in the NaiveProxy section of the app.',
+      ),
+      _FaqItem(
+        question: 'Hysteria2 — QUIC',
+        answer:
+            'Uses QUIC over UDP. Hysteria and Hysteria2 are different protocol versions; each profile shows its version.\n\n'
+            '• Link: hy2://\n'
+            '• Speed depends on the server and network quality.\n'
+            '• Suitable for video and downloads when UDP is available.\n'
+            '• May fail on networks where the operator blocks UDP.\n'
+            '• Shown in the Hysteria section of the app.',
+      ),
+      _FaqItem(
+        question: 'Reality — VLESS Reality',
+        answer:
+            'The main lightweight Xray protocol. It imitates a real TLS connection without a separate Reality certificate.\n\n'
+            '• Link: vless://\n'
+            '• Parameters: security=reality, type=tcp, flow=xtls-rprx-vision.\n'
+            '• Runs over TCP/443.\n'
+            '• HAProxy routes the connection to Xray by SNI.\n'
+            '• A strong balance of speed, stability, and camouflage.\n'
+            '• Shown in the VLESS section of the app.',
+      ),
+      _FaqItem(
+        question: 'XHTTP — VLESS XHTTP',
+        answer:
+            'Carries VLESS inside traffic that resembles normal HTTP requests.\n\n'
+            '• Link: vless://\n'
+            '• Transport: type=xhttp, usually mode=packet-up.\n'
+            '• The profile path is usually /xhttp.\n'
+            '• Security is profile-specific: security=tls or security=reality.\n'
+            '• Uses port 443; TLS profiles use HTTP/2.\n'
+            '• Runs on the bundled modern Xray core.\n'
+            '• XHTTP is currently available on Finland and the separate Poland 2 location.',
+      ),
+      _FaqItem(
+        question: 'Which protocol should I choose?',
+        answer:
+            '• Primary option: Reality.\n'
+            '• With UDP available: try Hysteria2.\n'
+            '• HTTPS compatibility: NaiveProxy.\n'
+            '• Additional modern option: XHTTP.\n\n'
+            'If a network blocks UDP, choose Reality or NaiveProxy instead of Hysteria2. No protocol guarantees stability on every network. HAProxy, Caddy, DNS, WARP, and Smart Route are not client protocols; they provide connection distribution, camouflage, DNS, and routing.',
+      ),
+      _FaqItem(
+        question: 'How does Smart Route work?',
+        answer:
+            'Smart Route splits traffic: known Russian services and apps connect directly, while international and unknown destinations use the VPN, including unknown .ru/.su/.рф sites. Banks, Gosuslugi, Yandex, VK, and marketplaces on the built-in allowlist may go direct; ChatGPT, Google, YouTube, Telegram, and other global services use the VPN. Browsers are not excluded wholesale: individual allowlisted domains can go direct. A direct destination sees your carrier IP.',
+      ),
+      _FaqItem(
+        question: 'How do I enable and verify Smart Route?',
+        answer:
+            '1. Open Settings (gear icon).\n'
+            '2. Enable Smart Route. An active VPN performs a short reconnect.\n'
+            '3. Test an allowlisted Russian service, then an international site or an unknown .ru site. The latter should see the VPN IP; an allowlisted direct service sees the carrier IP.\n'
+            '4. If a service takes the wrong route, temporarily disable Smart Route and send a developer report.\n\n'
+            'With Smart Route disabled, all regular traffic goes through the VPN.',
+      ),
+      _FaqItem(
+        question: 'How does Auto DNS work?',
+        answer:
+            'Auto DNS captures DNS requests inside the TUN and protects them from operator manipulation. Reality, Hysteria2, and XHTTP use protected Cloudflare and Google resolvers through the tunnel. NaiveProxy keeps local bootstrap DNS for compatibility and reliable server lookup; this is an intentional tradeoff of this mode.',
+      ),
+      _FaqItem(
+        question: 'How do I enable and verify Auto DNS?',
+        answer:
+            '1. Open Settings (gear icon) and find DNS.\n'
+            '2. Enable Auto DNS if the switch is available. An active VPN performs a short reconnect.\n'
+            '3. Keep Auto DNS enabled on LTE and public Wi-Fi.\n'
+            '4. If Wi-Fi requires a captive portal, temporarily disable the VPN or Auto DNS, sign in, then enable protection again.\n'
+            '5. Run a DNS leak test after connecting. Cloudflare or Google resolvers are expected for Reality, Hysteria2, and XHTTP.\n\n'
+            'Auto DNS does not change the VPN country and does not replace Smart Route.',
+      ),
+      _FaqItem(
+        question: 'What if internet stops after switching profiles?',
+        answer:
+            'Tap Disconnect, wait for Stopped, then connect again. If it repeats, send a developer report.',
+      ),
+      _FaqItem(
+        question: 'Why does Android need a notification?',
+        answer:
+            'Android requires a persistent notification for VPN. Allow notifications to see status and speed in the shade.',
+      ),
+      _FaqItem(
+        question: 'Why should mobile networks work better now?',
+        answer:
+            'The app uses one network baseline for Wi-Fi and LTE: smoother reconnects, strict TUN, and stable tunnel routing.',
+      ),
+      _FaqItem(
+        question: 'Is sending a report safe?',
+        answer:
+            'The report opens in your email before sending. Passwords, UUIDs, and keys are hidden automatically.',
+      ),
+    ],
+    logs: 'Logs and diagnostics',
+    noLogs: 'No logs yet.',
+    notificationDescription: 'VPN connection is active',
+  );
+}
+
+/// Presentation-only labels. They do not decide whether a profile can run
+/// or whether an expiry notice should be shown.
+final class HomeProfileLabels {
+  const HomeProfileLabels._(this._strings);
+
+  static const en = HomeProfileLabels._(_Strings.en);
+  static const ru = HomeProfileLabels._(_Strings.ru);
+
+  final _Strings _strings;
+
+  String unsupportedProtocol(VpnProfileKind kind) {
+    if (kind == VpnProfileKind.vlessXhttp) {
+      return switch (_strings) {
+        _Strings.en =>
+          'The bundled Xray core could not start this VLESS XHTTP profile. Check type, mode, path, TLS/Reality parameters, and Xray logs.',
+        _ =>
+          'Встроенное Xray-ядро не смогло запустить этот VLESS XHTTP профиль. Проверь type, mode, path, параметры TLS/Reality и логи Xray.',
+      };
+    }
+    return switch (_strings) {
+      _Strings.en =>
+        '${kind.label} is not enabled in this Android build. Use VLESS Reality, NaiveProxy, or Hysteria/Hysteria2.',
+      _ =>
+        '${kind.label} отключён в этой Android-сборке. Используй VLESS Reality, NaiveProxy или Hysteria/Hysteria2.',
+    };
+  }
+
+  String subscriptionStatus(DateTime? expiresAt, {required DateTime now}) {
+    if (expiresAt == null) {
+      return _strings.subscriptionUnknown;
+    }
+
+    final remaining = expiresAt.toUtc().difference(now.toUtc());
+    if (remaining.isNegative) {
+      return _strings.subscriptionExpired;
+    }
+
+    if (remaining.inHours < 24) {
+      final hours = remaining.inHours.clamp(1, 23);
+      return switch (_strings) {
+        _Strings.en => '$hours h left',
+        _ => 'Осталось $hours ч',
+      };
+    }
+
+    final days = remaining.inDays + (remaining.inHours % 24 == 0 ? 0 : 1);
+    return switch (_strings) {
+      _Strings.en => '$days d left',
+      _ => 'Осталось $days дн.',
+    };
+  }
+}

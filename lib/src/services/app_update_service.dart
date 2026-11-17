@@ -1,0 +1,992 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'kill_switch_http_policy.dart';
+import 'dart:typed_data';
+
+import 'package:flutter/services.dart';
+
+import '../tv_app_identity.dart';
+import 'app_release_version.dart';
+
+const _githubRepository = TvAppIdentity.repository;
+const _releaseApiUrls = [
+  'https://api.github.com/repos/$_githubRepository/releases/latest',
+];
+final _testingReleaseApiUri = Uri.parse(
+  'https://api.github.com/repos/$_githubRepository/releases?per_page=20',
+);
+const _githubReleaseAssetName = TvAppIdentity.releaseAssetName;
+const _updaterUserAgent = 'YurichConnect-Updater';
+const _updateConnectTimeout = Duration(seconds: 30);
+const _updateMetadataTimeout = Duration(seconds: 25);
+const _updateMetadataEndpointTimeout = Duration(seconds: 12);
+const _updateDownloadOpenTimeout = Duration(seconds: 60);
+const _updateDownloadIdleTimeout = Duration(seconds: 30);
+const _maxUpdateMetadataBytes = 1024 * 1024;
+const _maxApkDownloadBytes = 512 * 1024 * 1024;
+const _updateRetryDelays = [
+  Duration(seconds: 2),
+  Duration(seconds: 5),
+  Duration(seconds: 10),
+  Duration(seconds: 20),
+];
+const _apkZipMagic = [0x50, 0x4B];
+
+enum AppDistributionChannel {
+  github,
+  tv,
+  play,
+  soak,
+  unknown;
+
+  static AppDistributionChannel fromWireValue(String? value) {
+    return switch (value?.trim().toLowerCase()) {
+      'github' => AppDistributionChannel.github,
+      'tv' => AppDistributionChannel.tv,
+      'play' => AppDistributionChannel.play,
+      'soak' => AppDistributionChannel.soak,
+      _ => AppDistributionChannel.unknown,
+    };
+  }
+
+  // The standalone TV product uses a manual release-page handoff only.
+  bool get externalUpdatesEnabled => false;
+}
+
+class AppUpdateInfo {
+  const AppUpdateInfo({
+    required this.version,
+    required this.assetName,
+    required this.downloadUrl,
+    required this.size,
+    this.fallbackDownloadUrls = const [],
+  });
+
+  final String version;
+  final String assetName;
+  final Uri downloadUrl;
+  final int? size;
+  final List<Uri> fallbackDownloadUrls;
+}
+
+class AppUpdateApkInfo {
+  const AppUpdateApkInfo({
+    required this.packageName,
+    required this.version,
+    required this.buildNumber,
+    required this.signatureMatchesInstalled,
+    required this.signingCertificateSha256,
+  });
+
+  final String packageName;
+  final String version;
+  final int buildNumber;
+  final bool signatureMatchesInstalled;
+  final List<String> signingCertificateSha256;
+}
+
+class _UpdateHttpException implements Exception {
+  const _UpdateHttpException(this.statusCode);
+
+  final int statusCode;
+
+  @override
+  String toString() => 'HTTP $statusCode';
+}
+
+class AppUpdatePermissionException implements Exception {
+  const AppUpdatePermissionException();
+
+  @override
+  String toString() => 'Install permission is required.';
+}
+
+class AppUpdateArchitectureException implements Exception {
+  const AppUpdateArchitectureException();
+
+  @override
+  String toString() => 'Unable to determine Android CPU architecture.';
+}
+
+// A UI timeout alone does not cancel HttpClient work or release single-flight.
+class _UpdateLookupScope {
+  final _cancelled = Completer<void>();
+  final _requests = <HttpClientRequest>{};
+
+  void ensureActive() {
+    if (_cancelled.isCompleted) {
+      throw TimeoutException('Update check was cancelled.');
+    }
+  }
+
+  Future<T> wait<T>(Future<T> future) => Future.any([
+    future,
+    _cancelled.future.then<T>((_) {
+      throw TimeoutException('Update check was cancelled.');
+    }),
+  ]);
+
+  Future<HttpClientRequest> open(
+    HttpClient client,
+    Uri uri, {
+    bool head = false,
+  }) async {
+    ensureActive();
+    await wait(KillSwitchHttpPolicy.protect(client));
+    ensureActive();
+    return wait(
+      (head ? client.headUrl(uri) : client.getUrl(uri)).then((request) {
+        if (_cancelled.isCompleted) {
+          request.abort();
+          throw TimeoutException('Update check was cancelled.');
+        }
+        _requests.add(request);
+        return request;
+      }),
+    );
+  }
+
+  void release(HttpClientRequest request) {
+    _requests.remove(request);
+    request.abort();
+  }
+
+  void cancel() {
+    if (_cancelled.isCompleted) return;
+    _cancelled.complete();
+    for (final request in _requests) {
+      request.abort();
+    }
+    _requests.clear();
+  }
+}
+
+class AppUpdateDowngradeException implements Exception {
+  const AppUpdateDowngradeException({
+    required this.currentBuildNumber,
+    required this.updateBuildNumber,
+  });
+
+  final int currentBuildNumber;
+  final int updateBuildNumber;
+
+  @override
+  String toString() =>
+      'Update APK is not newer: installed build $currentBuildNumber, '
+      'downloaded build $updateBuildNumber.';
+}
+
+class AppUpdateIdentityException implements Exception {
+  const AppUpdateIdentityException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+abstract final class AppUpdateNoticePolicy {
+  static const interval = Duration(hours: 6);
+
+  static bool shouldCheck({
+    required Duration elapsed,
+    required Duration? lastAttempt,
+    required bool inFlight,
+    required bool foreground,
+  }) =>
+      foreground &&
+      !inFlight &&
+      (lastAttempt == null || elapsed - lastAttempt >= interval);
+}
+
+class AppUpdateService {
+  AppUpdateService({
+    HttpClient? client,
+    List<Uri>? releaseApiUris,
+    Uri? testingReleaseApiUri,
+    Uri? githubReleasePageUri,
+    Duration downloadIdleTimeout = _updateDownloadIdleTimeout,
+    Duration metadataEndpointTimeout = _updateMetadataEndpointTimeout,
+  }) : _httpClient = client ?? HttpClient(),
+       _downloadIdleTimeout = downloadIdleTimeout,
+       _metadataEndpointTimeout = metadataEndpointTimeout,
+       _testingReleaseUri = testingReleaseApiUri ?? _testingReleaseApiUri,
+       _githubReleasePageUri =
+           githubReleasePageUri ??
+           Uri.parse('https://github.com/$_githubRepository/releases/latest'),
+       _releaseApiUris =
+           releaseApiUris ??
+           _releaseApiUrls.map(Uri.parse).toList(growable: false) {
+    _client.connectionTimeout = _updateConnectTimeout;
+  }
+
+  static const _channel = MethodChannel('online.dnsai.ivanvpn/updater');
+
+  static Uri get latestApkDownloadUri => Uri.parse(
+    'https://github.com/$_githubRepository/releases/latest/download/'
+    '$_githubReleaseAssetName',
+  );
+
+  HttpClient _httpClient;
+  HttpClient get _client {
+    if (KillSwitchHttpPolicy.isRevoked(_httpClient)) {
+      _httpClient = HttpClient()..connectionTimeout = _updateConnectTimeout;
+    }
+    return _httpClient;
+  }
+
+  final Duration _downloadIdleTimeout;
+  final Duration _metadataEndpointTimeout;
+  final List<Uri> _releaseApiUris;
+  final Uri _testingReleaseUri;
+  final Uri _githubReleasePageUri;
+  Future<AppUpdateInfo?>? _pendingLookup;
+  String? _pendingLookupKey;
+
+  static bool usesTestingChannel(String version) =>
+      AppReleaseVersion.tryParse(version)?.isTesting == true;
+
+  static Uri manualDownloadUri(String version) => usesTestingChannel(version)
+      ? Uri.parse('https://github.com/$_githubRepository/releases')
+      : latestApkDownloadUri;
+
+  Future<List<String>> supportedAbis() async {
+    if (!Platform.isAndroid) {
+      return const [];
+    }
+    final value = await _channel.invokeMethod<List<Object?>>(
+      'getSupportedAbis',
+    );
+    return value?.whereType<String>().toList(growable: false) ?? const [];
+  }
+
+  Future<AppDistributionChannel> distributionChannel() async {
+    if (!Platform.isAndroid) {
+      return AppDistributionChannel.unknown;
+    }
+    final value = await _channel.invokeMethod<String>('getDistributionChannel');
+    return AppDistributionChannel.fromWireValue(value);
+  }
+
+  Future<bool> externalUpdatesEnabled() async =>
+      (await distributionChannel()).externalUpdatesEnabled;
+
+  Future<AppUpdateInfo?> findLatest({
+    required String currentVersion,
+    required List<String> supportedAbis,
+    Duration timeout = const Duration(seconds: 60),
+  }) {
+    if (supportedAbis.isEmpty) {
+      return Future.error(const AppUpdateArchitectureException());
+    }
+    if (AppReleaseVersion.tryParse(currentVersion) == null) {
+      return Future.error(StateError('Invalid installed app version.'));
+    }
+    if (timeout <= Duration.zero) {
+      return Future.error(ArgumentError.value(timeout, 'timeout'));
+    }
+    final key = jsonEncode([currentVersion, supportedAbis]);
+    if (_pendingLookupKey == key && _pendingLookup != null) {
+      return _pendingLookup!;
+    }
+    final scope = _UpdateLookupScope();
+    late final Future<AppUpdateInfo?> lookup;
+    lookup = _findLatest(currentVersion, supportedAbis, scope)
+        .timeout(
+          timeout,
+          onTimeout: () {
+            scope.cancel();
+            throw TimeoutException('Update check timed out.', timeout);
+          },
+        )
+        .whenComplete(() {
+          scope.cancel();
+          if (identical(_pendingLookup, lookup)) {
+            _pendingLookup = null;
+            _pendingLookupKey = null;
+          }
+        });
+    _pendingLookup = lookup;
+    _pendingLookupKey = key;
+    return lookup;
+  }
+
+  Future<AppUpdateInfo?> _findLatest(
+    String currentVersion,
+    List<String> supportedAbis,
+    _UpdateLookupScope scope,
+  ) async {
+    if (usesTestingChannel(currentVersion)) {
+      return _findTestingUpdate(currentVersion, supportedAbis, scope);
+    }
+    Object? lastError;
+    var sawNotNewerRelease = false;
+    for (final uri in _releaseApiUris) {
+      scope.ensureActive();
+      try {
+        final release = await _fetchRelease(uri, supportedAbis, scope);
+        if (release == null) {
+          continue;
+        }
+        if (_isVersionNewer(release.version, currentVersion)) {
+          return release;
+        }
+        sawNotNewerRelease = true;
+      } on Object catch (error) {
+        scope.ensureActive();
+        lastError = error;
+      }
+    }
+
+    try {
+      final release = await _fetchLatestGitHubReleaseViaRedirect(
+        supportedAbis,
+        scope,
+      );
+      if (release != null) {
+        if (_isVersionNewer(release.version, currentVersion)) {
+          return release;
+        }
+        sawNotNewerRelease = true;
+      }
+    } on Object catch (error) {
+      scope.ensureActive();
+      lastError = error;
+    }
+
+    if (lastError != null && !sawNotNewerRelease) {
+      throw StateError('$lastError');
+    }
+    return null;
+  }
+
+  Future<File> download(
+    AppUpdateInfo update, {
+    required void Function(double? progress) onProgress,
+  }) async {
+    if (!RegExp(
+      r'^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$',
+    ).hasMatch(update.assetName)) {
+      throw StateError('Invalid update APK filename.');
+    }
+    final version = _normalizeVersion(update.version);
+    if (AppReleaseVersion.tryParse(version) == null) {
+      throw StateError('Invalid update version.');
+    }
+    final tempDir = Directory(
+      '${Directory.systemTemp.path}${Platform.pathSeparator}'
+      'yurich_connect_updates${Platform.pathSeparator}$version',
+    );
+    if (!await tempDir.exists()) {
+      await tempDir.create(recursive: true);
+    }
+    final file = File(
+      '${tempDir.path}${Platform.pathSeparator}${update.assetName}',
+    );
+    if (await _isCompleteDownloadedFile(file, update.size)) {
+      onProgress(1);
+      return file;
+    }
+
+    Object? lastError;
+    final urls = <Uri>{
+      update.downloadUrl,
+      ...update.fallbackDownloadUrls,
+    }.toList(growable: false);
+
+    for (final url in urls) {
+      for (var attempt = 0; attempt < _updateRetryDelays.length; attempt += 1) {
+        try {
+          await _downloadToFile(update, url, file, onProgress);
+          await _verifyApkFile(file, update.size);
+          return file;
+        } on Object catch (error) {
+          lastError = error;
+          if (await file.exists()) {
+            await file.delete();
+          }
+          if (!_shouldRetryUpdateError(error) ||
+              attempt == _updateRetryDelays.length - 1) {
+            break;
+          }
+          await Future<void>.delayed(_updateRetryDelays[attempt]);
+        }
+      }
+    }
+
+    throw StateError('$lastError');
+  }
+
+  Future<void> _downloadToFile(
+    AppUpdateInfo update,
+    Uri url,
+    File file,
+    void Function(double? progress) onProgress,
+  ) async {
+    _validateRemoteUpdateUri(url);
+    final client = _client;
+    await KillSwitchHttpPolicy.protect(client);
+    final request = await client.getUrl(url);
+    request.headers.set(HttpHeaders.userAgentHeader, _updaterUserAgent);
+    request.headers.set(
+      HttpHeaders.acceptHeader,
+      'application/vnd.android.package-archive, application/octet-stream, */*',
+    );
+    request.followRedirects = true;
+    final response = await request.close().timeout(
+      _updateDownloadOpenTimeout,
+      onTimeout: () {
+        request.abort();
+        throw TimeoutException('Update server response timed out.');
+      },
+    );
+    for (final redirect in response.redirects) {
+      _validateRemoteUpdateUri(redirect.location);
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      request.abort();
+      throw _UpdateHttpException(response.statusCode);
+    }
+    if (response.contentLength > _maxApkDownloadBytes) {
+      request.abort();
+      throw StateError('Update APK exceeds the 512 MiB safety limit.');
+    }
+
+    final sink = file.openWrite();
+    var received = 0;
+    final total = response.contentLength > 0
+        ? response.contentLength
+        : update.size;
+    try {
+      await for (final chunk in response.timeout(_downloadIdleTimeout)) {
+        received += chunk.length;
+        if (received > _maxApkDownloadBytes) {
+          throw StateError('Update APK exceeds the 512 MiB safety limit.');
+        }
+        sink.add(chunk);
+        if (total != null && total > 0) {
+          onProgress((received / total).clamp(0, 1).toDouble());
+        } else {
+          onProgress(null);
+        }
+      }
+    } on Object {
+      request.abort();
+      rethrow;
+    } finally {
+      await sink.close();
+    }
+    onProgress(1);
+
+    await _verifyApkFile(file, update.size);
+  }
+
+  void _validateRemoteUpdateUri(Uri uri) {
+    if (uri.scheme == 'https' && uri.host.isNotEmpty) {
+      return;
+    }
+    final address = InternetAddress.tryParse(uri.host);
+    final loopback =
+        uri.scheme == 'http' &&
+        (uri.host.toLowerCase() == 'localhost' || address?.isLoopback == true);
+    if (!loopback) {
+      throw StateError('Update downloads require HTTPS.');
+    }
+  }
+
+  Future<bool> _isCompleteDownloadedFile(File file, int? expectedSize) async {
+    try {
+      await _verifyApkFile(file, expectedSize);
+      return true;
+    } on Object {
+      return false;
+    }
+  }
+
+  Future<void> _verifyApkFile(File file, int? expectedSize) async {
+    if (!await file.exists()) {
+      throw StateError('APK file does not exist.');
+    }
+    final actualSize = await file.length();
+    if (actualSize <= 0) {
+      throw StateError('APK file is empty.');
+    }
+    if (expectedSize != null &&
+        expectedSize > 0 &&
+        actualSize != expectedSize) {
+      throw StateError(
+        'APK size mismatch: expected $expectedSize bytes, got $actualSize.',
+      );
+    }
+    final reader = await file.open();
+    try {
+      final header = await reader.read(4);
+      if (header.length < 4 ||
+          header[0] != _apkZipMagic[0] ||
+          header[1] != _apkZipMagic[1]) {
+        throw StateError(
+          'Downloaded file is not an APK archive. '
+          'Please retry the update.',
+        );
+      }
+    } finally {
+      await reader.close();
+    }
+  }
+
+  Future<AppUpdateApkInfo> inspectApk(File file) async {
+    final value = await _channel.invokeMethod<Map<Object?, Object?>>(
+      'inspectApk',
+      {'path': file.path},
+    );
+    if (value == null) {
+      throw StateError('Android cannot inspect update APK.');
+    }
+    return AppUpdateApkInfo(
+      packageName: value['packageName']?.toString() ?? '',
+      version: value['versionName']?.toString() ?? '',
+      buildNumber: _toInt(value['versionCode']),
+      signatureMatchesInstalled: value['signatureMatchesInstalled'] == true,
+      signingCertificateSha256:
+          (value['signingCertificateSha256'] as List?)
+              ?.whereType<String>()
+              .toList(growable: false) ??
+          const [],
+    );
+  }
+
+  Future<void> installApk(
+    File file, {
+    int? currentBuildNumber,
+    String? expectedVersion,
+  }) async {
+    final apkInfo = await inspectApk(file);
+    validateInspectedApk(
+      apkInfo,
+      currentBuildNumber: currentBuildNumber,
+      expectedVersion: expectedVersion,
+    );
+    try {
+      await _channel.invokeMethod<void>('installApk', {'path': file.path});
+    } on PlatformException catch (error) {
+      if (error.code == 'INSTALL_PERMISSION') {
+        throw const AppUpdatePermissionException();
+      }
+      rethrow;
+    }
+  }
+
+  void validateInspectedApk(
+    AppUpdateApkInfo apkInfo, {
+    int? currentBuildNumber,
+    String? expectedVersion,
+  }) {
+    if (apkInfo.packageName != TvAppIdentity.applicationId) {
+      throw AppUpdateIdentityException(
+        'Update package mismatch: ${apkInfo.packageName}.',
+      );
+    }
+    if (!apkInfo.signatureMatchesInstalled ||
+        apkInfo.signingCertificateSha256.isEmpty) {
+      throw const AppUpdateIdentityException(
+        'Update signing certificate does not match installed app.',
+      );
+    }
+    if (expectedVersion != null) {
+      final expected = AppReleaseVersion.tryParse(expectedVersion);
+      final actual = AppReleaseVersion.tryParse(apkInfo.version);
+      if (expected == null ||
+          actual == null ||
+          expected.value != actual.value) {
+        throw const AppUpdateIdentityException(
+          'Update APK version does not match selected release.',
+        );
+      }
+    }
+    if (currentBuildNumber != null &&
+        currentBuildNumber > 0 &&
+        apkInfo.buildNumber <= currentBuildNumber) {
+      throw AppUpdateDowngradeException(
+        currentBuildNumber: currentBuildNumber,
+        updateBuildNumber: apkInfo.buildNumber,
+      );
+    }
+  }
+
+  int _toInt(Object? value) {
+    return switch (value) {
+      int() => value,
+      num() => value.round(),
+      String() => int.tryParse(value) ?? 0,
+      _ => 0,
+    };
+  }
+
+  Future<void> openInstallSettings() async {
+    if (Platform.isAndroid) {
+      await _channel.invokeMethod<void>('openInstallSettings');
+    }
+  }
+
+  Future<AppUpdateInfo?> _fetchRelease(
+    Uri uri,
+    List<String> supportedAbis,
+    _UpdateLookupScope scope,
+  ) async {
+    final metadata = await _fetchReleaseMetadata(uri, scope);
+    if (metadata != null && metadata is! Map<String, dynamic>) {
+      throw StateError('Stable update metadata must be an object.');
+    }
+    return metadata == null
+        ? null
+        : _updateFromMetadata(metadata as Map<String, dynamic>, supportedAbis);
+  }
+
+  Future<AppUpdateInfo?> _findTestingUpdate(
+    String currentVersion,
+    List<String> supportedAbis,
+    _UpdateLookupScope scope,
+  ) async {
+    final metadata = await _fetchReleaseMetadata(_testingReleaseUri, scope);
+    if (metadata == null) {
+      throw StateError('Testing release feed is unavailable (HTTP 404).');
+    }
+    if (metadata is! List) {
+      throw StateError('Testing update metadata must be a release list.');
+    }
+    AppUpdateInfo? newest;
+    for (final entry in metadata.take(20).whereType<Map<String, dynamic>>()) {
+      final update = _updateFromMetadata(
+        entry,
+        supportedAbis,
+        allowTesting: true,
+      );
+      if (update != null &&
+          _isVersionNewer(update.version, currentVersion) &&
+          (newest == null || _isVersionNewer(update.version, newest.version))) {
+        newest = update;
+      }
+    }
+    return newest;
+  }
+
+  AppUpdateInfo? _updateFromMetadata(
+    Map<String, dynamic> json,
+    List<String> supportedAbis, {
+    bool allowTesting = false,
+  }) {
+    if (json['draft'] == true) return null;
+    final version = (json['version'] ?? json['tag_name'] ?? json['name'] ?? '')
+        .toString();
+    final parsedVersion = AppReleaseVersion.tryParse(version);
+    if (parsedVersion == null ||
+        (parsedVersion.isTesting && json['prerelease'] != true) ||
+        (!parsedVersion.isTesting && json['prerelease'] == true) ||
+        (!allowTesting &&
+            (parsedVersion.isTesting || json['prerelease'] == true))) {
+      return null;
+    }
+
+    final assets = (json['assets'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => item.cast<String, dynamic>())
+        .toList(growable: false);
+    final selected = _selectAsset(assets, supportedAbis, parsedVersion.value);
+    if (selected == null) {
+      return null;
+    }
+
+    final downloadUrl =
+        (selected['download_url'] ?? selected['browser_download_url'] ?? '')
+            .toString();
+    if (downloadUrl.isEmpty) {
+      throw StateError('Update asset has no download URL.');
+    }
+
+    return AppUpdateInfo(
+      version: _normalizeVersion(version),
+      assetName: selected['name']?.toString() ?? 'YurichConnect-update.apk',
+      downloadUrl: Uri.parse(downloadUrl),
+      fallbackDownloadUrls: _githubDownloadUrls(
+        _normalizeVersion(version),
+        selected['name']?.toString() ?? _githubReleaseAssetName,
+      ),
+      size: selected['size'] is int ? selected['size'] as int : null,
+    );
+  }
+
+  Future<T> _readMetadataEndpoint<T>(
+    _UpdateLookupScope parent,
+    Future<T> Function(_UpdateLookupScope scope) read,
+  ) {
+    parent.ensureActive();
+    final scope = _UpdateLookupScope();
+    return parent
+        .wait(
+          read(scope).timeout(
+            _metadataEndpointTimeout,
+            onTimeout: () {
+              scope.cancel();
+              throw TimeoutException(
+                'Update endpoint timed out.',
+                _metadataEndpointTimeout,
+              );
+            },
+          ),
+        )
+        .whenComplete(scope.cancel);
+  }
+
+  Future<Object?> _fetchReleaseMetadata(Uri uri, _UpdateLookupScope scope) =>
+      _readMetadataEndpoint(
+        scope,
+        (child) => _fetchReleaseMetadataRequest(uri, child),
+      );
+
+  Future<Object?> _fetchReleaseMetadataRequest(
+    Uri uri,
+    _UpdateLookupScope scope,
+  ) async {
+    _validateRemoteUpdateUri(uri);
+    Object? lastError;
+    for (var attempt = 0; attempt < _updateRetryDelays.length; attempt += 1) {
+      scope.ensureActive();
+      HttpClientRequest? request;
+      try {
+        request = await scope.open(_client, uri);
+        request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+        request.headers.set(HttpHeaders.userAgentHeader, _updaterUserAgent);
+        request.followRedirects = true;
+        final response = await request.close().timeout(_updateMetadataTimeout);
+        for (final redirect in response.redirects) {
+          _validateRemoteUpdateUri(redirect.location);
+        }
+        if (response.statusCode == HttpStatus.notFound) {
+          await response.drain<void>();
+          return null;
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          await response.drain<void>();
+          throw _UpdateHttpException(response.statusCode);
+        }
+
+        final raw = await _readLimitedMetadata(response);
+        return jsonDecode(raw);
+      } on Object catch (error) {
+        scope.ensureActive();
+        lastError = error;
+        if (!_shouldRetryUpdateError(error) ||
+            attempt == _updateRetryDelays.length - 1) {
+          break;
+        }
+      } finally {
+        if (request != null) scope.release(request);
+      }
+      await scope.wait(Future<void>.delayed(_updateRetryDelays[attempt]));
+    }
+
+    throw StateError('$lastError');
+  }
+
+  Future<String> _readLimitedMetadata(HttpClientResponse response) async {
+    if (response.contentLength > _maxUpdateMetadataBytes) {
+      await response.drain<void>();
+      throw StateError('Update metadata exceeds the 1 MiB safety limit.');
+    }
+    final bytes = BytesBuilder(copy: false);
+    var received = 0;
+    await for (final chunk in response.timeout(_updateMetadataTimeout)) {
+      received += chunk.length;
+      if (received > _maxUpdateMetadataBytes) {
+        throw StateError('Update metadata exceeds the 1 MiB safety limit.');
+      }
+      bytes.add(chunk);
+    }
+    return utf8.decode(bytes.takeBytes());
+  }
+
+  Future<AppUpdateInfo?> _fetchLatestGitHubReleaseViaRedirect(
+    List<String> supportedAbis,
+    _UpdateLookupScope scope,
+  ) async {
+    final tag = await _fetchLatestGitHubTag(scope);
+    if (tag == null) return null;
+    final parsedVersion = AppReleaseVersion.tryParse(tag);
+    if (parsedVersion == null || parsedVersion.isTesting) {
+      return null;
+    }
+
+    for (final assetName in _githubAssetNameCandidates(tag, supportedAbis)) {
+      final urls = _githubDownloadUrls(tag, assetName);
+      final size = await _tryFetchContentLength(urls.first, scope);
+      if (size == null && assetName != _githubReleaseAssetName) {
+        continue;
+      }
+      return AppUpdateInfo(
+        version: _normalizeVersion(tag),
+        assetName: assetName,
+        downloadUrl: urls.first,
+        fallbackDownloadUrls: urls.skip(1).toList(growable: false),
+        size: size,
+      );
+    }
+
+    return null;
+  }
+
+  Future<String?> _fetchLatestGitHubTag(_UpdateLookupScope scope) =>
+      _readMetadataEndpoint(scope, _fetchLatestGitHubTagRequest);
+
+  Future<String?> _fetchLatestGitHubTagRequest(_UpdateLookupScope scope) async {
+    Object? lastError;
+    final uri = _githubReleasePageUri;
+    _validateRemoteUpdateUri(uri);
+    for (var attempt = 0; attempt < _updateRetryDelays.length; attempt += 1) {
+      scope.ensureActive();
+      HttpClientRequest? request;
+      try {
+        request = await scope.open(_client, uri);
+        request.headers.set(HttpHeaders.userAgentHeader, _updaterUserAgent);
+        request.followRedirects = false;
+        final response = await request.close().timeout(_updateMetadataTimeout);
+        final location = response.headers.value(HttpHeaders.locationHeader);
+        await response.drain<void>();
+
+        final resolved = location == null ? uri : uri.resolve(location);
+        final tag = _tagFromGitHubReleaseUri(resolved);
+        if (tag != null) {
+          return tag;
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 400) {
+          throw _UpdateHttpException(response.statusCode);
+        }
+        return null;
+      } on Object catch (error) {
+        scope.ensureActive();
+        lastError = error;
+        if (!_shouldRetryUpdateError(error) ||
+            attempt == _updateRetryDelays.length - 1) {
+          break;
+        }
+      } finally {
+        if (request != null) scope.release(request);
+      }
+      await scope.wait(Future<void>.delayed(_updateRetryDelays[attempt]));
+    }
+
+    throw StateError('$lastError');
+  }
+
+  String? _tagFromGitHubReleaseUri(Uri uri) {
+    final segments = uri.pathSegments;
+    final tagIndex = segments.indexOf('tag');
+    if (tagIndex < 0 || tagIndex + 1 >= segments.length) {
+      return null;
+    }
+    return segments[tagIndex + 1];
+  }
+
+  Future<int?> _tryFetchContentLength(Uri uri, _UpdateLookupScope scope) async {
+    try {
+      return await _readMetadataEndpoint(
+        scope,
+        (child) => _fetchContentLength(uri, child),
+      );
+    } on Object {
+      scope.ensureActive();
+      return null;
+    }
+  }
+
+  Future<int?> _fetchContentLength(Uri uri, _UpdateLookupScope scope) async {
+    HttpClientRequest? request;
+    try {
+      request = await scope.open(_client, uri, head: true);
+      request.headers.set(HttpHeaders.userAgentHeader, _updaterUserAgent);
+      request.followRedirects = true;
+      final response = await request.close().timeout(_updateMetadataTimeout);
+      final length = response.contentLength;
+      await response.drain<void>();
+      return response.statusCode >= 200 &&
+              response.statusCode < 300 &&
+              length > 0
+          ? length
+          : null;
+    } on Object {
+      scope.ensureActive();
+      return null;
+    } finally {
+      if (request != null) scope.release(request);
+    }
+  }
+
+  List<Uri> _githubDownloadUrls(String version, String assetName) {
+    final normalized = _normalizeVersion(version);
+    final tag = normalized.startsWith('v') ? normalized : 'v$normalized';
+    return [
+      Uri.parse(
+        'https://github.com/$_githubRepository/releases/download/$tag/$assetName',
+      ),
+    ];
+  }
+
+  List<String> _githubAssetNameCandidates(
+    String version,
+    List<String> supportedAbis,
+  ) {
+    final normalized = _normalizeVersion(version);
+    return [
+      if (supportedAbis.contains('arm64-v8a') ||
+          supportedAbis.contains('armeabi-v7a')) ...[
+        'YurichConnect-android-tv-v$normalized.apk',
+        _githubReleaseAssetName,
+      ],
+    ];
+  }
+
+  bool _shouldRetryUpdateError(Object error) {
+    if (error is TimeoutException || error is SocketException) {
+      return true;
+    }
+    if (error is _UpdateHttpException) {
+      return error.statusCode == HttpStatus.requestTimeout ||
+          error.statusCode == 429 ||
+          error.statusCode >= 500;
+    }
+    final text = '$error';
+    return text.contains('HTTP 408') ||
+        text.contains('HTTP 429') ||
+        RegExp(r'HTTP 5\d\d').hasMatch(text);
+  }
+
+  Map<String, dynamic>? _selectAsset(
+    List<Map<String, dynamic>> assets,
+    List<String> supportedAbis,
+    String version,
+  ) {
+    for (final name in _githubAssetNameCandidates(version, supportedAbis)) {
+      for (final asset in assets) {
+        final state = asset['state'];
+        if (asset['name'] == name && (state == null || state == 'uploaded')) {
+          return asset;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  bool _isVersionNewer(String remote, String current) {
+    final remoteVersion = AppReleaseVersion.tryParse(remote);
+    final currentVersion = AppReleaseVersion.tryParse(current);
+    return remoteVersion != null &&
+        currentVersion != null &&
+        remoteVersion.compareTo(currentVersion) > 0;
+  }
+
+  String _normalizeVersion(String value) {
+    return AppReleaseVersion.tryParse(value)?.value ?? value;
+  }
+}

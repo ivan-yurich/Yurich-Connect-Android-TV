@@ -1,0 +1,93 @@
+import 'package:flutter/services.dart';
+
+class DiagnosticRun {
+  static const standardMode = 'standard';
+  static const passive24hMode = 'passive_24h';
+
+  const DiagnosticRun({
+    this.active = false,
+    this.available = false,
+    this.startedAt,
+    this.endsAt,
+    this.endedAt,
+    this.events = 0,
+    this.rotatedEvents = 0,
+    this.mode = standardMode,
+    this.durationHours = 7 * 24,
+  });
+
+  final bool active;
+  final bool available;
+  final DateTime? startedAt;
+  final DateTime? endsAt;
+  final DateTime? endedAt;
+  final int events;
+  final int rotatedEvents;
+  final String mode;
+  final int durationHours;
+
+  bool get isPassive24h => mode == passive24hMode;
+
+  bool get stoppedEarly =>
+      endedAt != null && endsAt != null && endedAt!.isBefore(endsAt!);
+
+  factory DiagnosticRun.fromMap(Map<dynamic, dynamic> value) {
+    DateTime? date(String key) {
+      final milliseconds = value[key];
+      return milliseconds is int &&
+              milliseconds > 0 &&
+              milliseconds <= 8640000000000000
+          ? DateTime.fromMillisecondsSinceEpoch(milliseconds)
+          : null;
+    }
+
+    final rawMode = value['mode'];
+    final mode = rawMode == passive24hMode ? passive24hMode : standardMode;
+    final rawDurationHours = value['durationHours'];
+    final durationHours =
+        rawDurationHours is int &&
+            rawDurationHours > 0 &&
+            rawDurationHours <= 7 * 24
+        ? rawDurationHours
+        : (mode == passive24hMode ? 24 : 7 * 24);
+
+    return DiagnosticRun(
+      active: value['active'] == true,
+      available: value['available'] == true,
+      startedAt: date('startedAtMs'),
+      endsAt: date('endsAtMs'),
+      endedAt: date('endedAtMs'),
+      events: value['events'] is int ? value['events'] as int : 0,
+      rotatedEvents: value['rotatedEvents'] is int
+          ? value['rotatedEvents'] as int
+          : 0,
+      mode: mode,
+      durationHours: durationHours,
+    );
+  }
+}
+
+class OnDeviceDiagnosticsService {
+  static const channel = MethodChannel('online.dnsai.ivanvpn/diagnostics');
+
+  Future<DiagnosticRun> status() => _run('status');
+  Future<DiagnosticRun> start() => _run('start');
+  Future<DiagnosticRun> stop() => _run('stop');
+
+  Future<DiagnosticRun> _run(String method) async {
+    final value = await channel.invokeMapMethod<dynamic, dynamic>(method);
+    return DiagnosticRun.fromMap(value ?? const {});
+  }
+
+  Future<bool> export() async =>
+      await channel.invokeMethod<bool>('export') ?? false;
+
+  static Future<void> recordError(String type) async {
+    if (!const {'framework', 'uncaught', 'event_stream'}.contains(type)) return;
+    try {
+      await channel.invokeMethod<void>('recordError', {'type': type});
+    } on Object {
+      // Diagnostics are optional and must not recursively report their own errors.
+    }
+  }
+}

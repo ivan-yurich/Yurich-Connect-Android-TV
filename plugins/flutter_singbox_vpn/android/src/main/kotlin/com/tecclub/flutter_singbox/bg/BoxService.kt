@@ -1,0 +1,2379 @@
+package com.tecclub.flutter_singbox.bg
+
+import com.tecclub.flutter_singbox.model.ConnectionUiState
+
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.os.SystemClock
+import androidx.annotation.RequiresApi
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.MutableLiveData
+import com.tecclub.flutter_singbox.Application
+import com.tecclub.flutter_singbox.config.SimpleConfigManager
+import com.tecclub.flutter_singbox.config.SingBoxRuntimeConfig
+import com.tecclub.flutter_singbox.constant.Action
+import com.tecclub.flutter_singbox.constant.Alert
+import com.tecclub.flutter_singbox.constant.Status
+import com.tecclub.flutter_singbox.database.Settings
+import com.tecclub.flutter_singbox.diagnostics.OnDeviceDiagnostics
+import com.tecclub.flutter_singbox.diagnostics.HermesDeliveryLane
+import com.tecclub.flutter_singbox.diagnostics.HermesLiveRoute
+import com.tecclub.flutter_singbox.diagnostics.HermesPilotGate
+import com.tecclub.flutter_singbox.session.VpnSessionPhase
+import com.tecclub.flutter_singbox.session.VpnSessionSnapshot
+import com.tecclub.flutter_singbox.session.VpnSessionStateMachine
+import com.tecclub.flutter_singbox.xray.XrayRuntimeConfig
+import com.tecclub.flutter_singbox.xray.XrayRunner
+import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.CommandServerHandler
+import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.PlatformInterface
+import io.nekohasekai.libbox.SystemProxyStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
+import kotlin.concurrent.thread
+import kotlin.system.exitProcess
+
+class BoxService(
+    private val service: Service, private val platformInterface: PlatformInterface
+) : CommandServerHandler {
+
+    companion object {
+        const val ACTION_START = "io.nekohasekai.sfa.ACTION_START"
+        const val EXTRA_CONFIG_CONTENT = "config_content"
+        private const val WATCHDOG_MIXED_PROXY_PORT = 20808
+        private const val WATCHDOG_INITIAL_GRACE_MS = 30_000L
+        private const val WATCHDOG_INTERVAL_MS = 60_000L
+        private const val WATCHDOG_IDLE_INTERVAL_MS = 90_000L
+        private const val RESOURCE_GUARD_INTERVAL_MS = 30_000L
+        private const val WATCHDOG_FLAP_WINDOW_MS = 5 * 60 * 1000L
+        private const val WATCHDOG_FLAP_RESTART_THRESHOLD = 4
+        // Both embedded runtimes expose the mixed proxy in well under 500 ms on
+        // supported devices. Keep a small settle window, then rely on the real
+        // 2-of-3 external quorum instead of an unconditional startup sleep.
+        private const val READINESS_INITIAL_DELAY_MS = 750L
+        private const val READINESS_RETRY_DELAY_MS = 3_000L
+        private const val READINESS_PROBE_ATTEMPTS = 2
+        private const val READINESS_QUORUM_DEADLINE_MS = 12_000L
+        // elapsedRealtime-based coroutine deadlines cannot fire while the CPU is
+        // suspended. Keep it awake only for the bounded external readiness probe
+        // and a short socket-cleanup grace period.
+        private const val READINESS_PROBE_WAKE_LOCK_MS = 15_000L
+        private const val READINESS_STARTUP_RESTART_GRACE_MS = 30_000L
+        private const val HEALTH_CONNECT_TIMEOUT_MS = 2_000
+        private const val HEALTH_PROXY_RESPONSE_TIMEOUT_MS = 3_000
+        private const val HEALTH_TLS_TIMEOUT_MS = 4_000
+        // Keep the CPU awake only while starting/recovering a tunnel. A healthy
+        // foreground VPN must be allowed to enter Doze instead of extending this
+        // lock from every periodic health probe.
+        private const val KEEPER_WAKE_LOCK_MS = 60_000L
+        private const val STICKY_RESTART_DELAY_MS = 2_500L
+        private const val NETWORK_RESET_DELAY_MS = 250L
+        private const val NETWORK_SETTLE_DELAY_MS = 6_000L
+        private const val XRAY_NETWORK_SETTLE_DELAY_MS = 4_000L
+        private const val WAKE_SETTLE_DELAY_MS = 3_000L
+        private const val NETWORK_WAKE_DEBOUNCE_MS = 5_000L
+        private const val NETWORK_WAKE_GRACE_MS = 45_000L
+        private const val LIFECYCLE_RECOVERY_TIMEOUT_MS = 30_000L
+        private const val CORE_PROCESS_EXIT_DELAY_MS = 600L
+        @Volatile private var processRuntimeCore: VpnRuntimeCore? = null
+        @Volatile private var processUsedHysteria2 = false
+
+        fun start() {
+            val intent = Intent(Application.application, Settings.serviceClass()).apply {
+                action = ACTION_START
+            }
+            ContextCompat.startForegroundService(Application.application, intent)
+        }
+
+        fun stop() {
+            Application.application.sendBroadcast(
+                Intent(Action.SERVICE_CLOSE).setPackage(
+                    Application.application.packageName
+                )
+            )
+        }
+    }
+
+    @Volatile var fileDescriptor: ParcelFileDescriptor? = null
+    @Volatile private var appCommandToken: String? = null
+    @Volatile private var hermesManagedFingerprint: String? = null
+    internal fun isDesiredRunning(): Boolean = sessionState.snapshot().desiredRunning
+    internal fun isRuntimeConnected(): Boolean = sessionState.snapshot().phase == VpnSessionPhase.Connected
+
+    internal fun rememberAppCommand(token: String?, managedFingerprint: String? = null) {
+        if (hermesManagedFingerprint != null || hermesLane != null) {
+            hermesLane?.invalidateRoute()
+        }
+        hermesManagedFingerprint = managedFingerprint
+        appCommandToken = token
+    }
+
+    internal fun rejectSupersededStart(startId: Int): Int {
+        // A stale start on an already active/newer service must not stop it.
+        // A cold start delivered via startForegroundService, however, owes
+        // Android a foreground notification even when no tunnel is opened.
+        if (isDesiredRunning()) {
+            return if (runCatching { SimpleConfigManager.getStartedByUser() }.getOrDefault(false)) {
+                Service.START_STICKY
+            } else Service.START_NOT_STICKY
+        }
+        if (currentSessionStatus() == Status.Stopped) {
+            notification.show(ConnectionUiState.disconnected())
+            service.stopSelfResult(startId)
+        }
+        return Service.START_NOT_STICKY
+    }
+
+    private val status = MutableLiveData(Status.Stopped)
+    private val binder = ServiceBinder(status) // We're using StatusClient now for traffic stats
+    private val notification: ServiceNotification by lazy {
+        ServiceNotification(service)
+    }
+    private var commandServer: CommandServer? = null
+    @Volatile private var xrayRunner: XrayRunner? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val hermesNetworkEpoch = AtomicLong()
+    @Volatile private var hermesLane: HermesDeliveryLane? = null
+    private val hermesLaneLock = Any()
+    private var hermesDestroyed = false
+    // The Android Service is constructed before attachBaseContext().
+    private val hermesBuild by lazy { service is VPNService && HermesPilotGate.enabled(service) }
+    private val sessionState = VpnSessionStateMachine()
+    private val instanceElapsedMs = SystemClock.elapsedRealtime()
+    @Volatile private var lifecyclePhaseStamp = LifecyclePhaseStamp(
+        generation = 0L,
+        phase = VpnSessionPhase.Stopped,
+        startedAtElapsedMs = instanceElapsedMs,
+    )
+    private val nativeSoakObserver by lazy {
+        NativeSoakObserver(service) { includeNetwork ->
+            val snapshot = sessionState.snapshot()
+            val uid = android.os.Process.myUid()
+            NativeSoakSnapshot(
+                pid = android.os.Process.myPid(),
+                instanceElapsedMs = instanceElapsedMs,
+                elapsedMs = SystemClock.elapsedRealtime(),
+                generation = snapshot.generation,
+                phase = snapshot.phase,
+                desiredRunning = snapshot.desiredRunning,
+                runtime = activeRuntimeCore,
+                tunOpen = runCatching { fileDescriptor?.fileDescriptor?.valid() == true }
+                    .getOrDefault(false),
+                uidTxBytes = android.net.TrafficStats.getUidTxBytes(uid),
+                uidRxBytes = android.net.TrafficStats.getUidRxBytes(uid),
+                network = if (includeNetwork) captureNativeNetwork() else NativeNetworkSnapshot(),
+                configFingerprint = nativeConfigBinding?.forGeneration(snapshot.generation),
+            )
+        }
+    }
+    private val lifecycleMutex = Mutex()
+    private val recoveryBudgetMutex = Mutex()
+    private var lifecycleJob: Job? = null
+    private var watchdogJob: Job? = null
+    private var resourceGuardJob: Job? = null
+    private var networkResetJob: Job? = null
+    @Volatile private var readinessJob: Job? = null
+    private val readinessRevision = AtomicLong(0L)
+    private val readinessProbeCoordinator = ReadinessProbeCoordinator()
+    private var watchdogFailures = 0
+    private val watchdogFlapDetector = TunnelFlapDetector(
+        threshold = WATCHDOG_FLAP_RESTART_THRESHOLD,
+        windowMs = WATCHDOG_FLAP_WINDOW_MS,
+    )
+    private val networkResetTracker = NetworkResetTracker<Network>()
+    private var watchdogMixedProxyEnabled = false
+    private var lastNetworkWakeEventAt = 0L
+    @Volatile private var watchdogRestarting = false
+    @Volatile private var stickyRestartScheduled = false
+    @Volatile private var cleanProcessRestartScheduled = false
+    @Volatile private var lastHealthyDefaultNetwork: Network? = null
+    private var keeperWakeLock: PowerManager.WakeLock? = null
+    private var receiverRegistered = false
+    private var lastConfigFingerprint: String? = null
+    @Volatile private var nativeConfigBinding: NativeConfigBinding? = null
+    private var activeRuntimeCore: VpnRuntimeCore? = null
+    private var diagnosticProtocol = "unknown"
+    private var diagnosticProcessAnnounced = false
+
+    private fun recordDiagnostic(code: String, numbers: Map<String, Long> = emptyMap(),
+                                 labels: Map<String, String> = emptyMap()) {
+        runCatching {
+            val snapshot = sessionState.snapshot()
+            val network = captureNativeNetwork()
+            OnDeviceDiagnostics.record(service, code, mapOf(
+                "pid" to android.os.Process.myPid().toLong(), "instanceMs" to instanceElapsedMs,
+                "generation" to snapshot.generation,
+                "desired" to if (snapshot.desiredRunning) 1L else 0L,
+                "tun" to if (fileDescriptor?.fileDescriptor?.valid() == true) 1L else 0L,
+                "activeNet" to network.activeFlags.toLong(), "trackedNet" to network.trackedFlags.toLong(),
+                "sameNet" to network.sameNetwork.toLong(),
+            ) + numbers, mapOf(
+                "phase" to snapshot.phase.name, "protocol" to diagnosticProtocol,
+                "transport" to network.physicalTransport(),
+                "core" to when (activeRuntimeCore) {
+                    VpnRuntimeCore.SingBox -> "singbox"
+                    VpnRuntimeCore.Xray -> "xray"
+                    null -> "unknown"
+                },
+            ) + labels, fingerprint = nativeConfigBinding?.forGeneration(snapshot.generation))
+            OnDeviceDiagnostics.sample(service)
+        }
+    }
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Action.SERVICE_CLOSE -> {
+                    val close = {
+                        if (intent.getBooleanExtra(Action.EXTRA_USER_INITIATED, false)) {
+                            SimpleConfigManager.setStartedByUser(false)
+                            SimpleConfigManager.setManualDisconnectRequested(true)
+                        }
+                        stopService()
+                    }
+                    if (intent.hasExtra(VpnCommandFence.EXTRA_TOKEN)) {
+                        VpnCommandFence.runCurrent(service, intent.getStringExtra(VpnCommandFence.EXTRA_TOKEN),
+                            VpnCommandFence.Kind.Stop, close)
+                    } else {
+                        close()
+                    }
+                }
+
+                Action.SERVICE_RESTART -> {
+                    if (intent.getBooleanExtra(Action.EXTRA_USER_INITIATED, false)) {
+                        SimpleConfigManager.setStartedByUser(true)
+                        SimpleConfigManager.setManualDisconnectRequested(false)
+                    }
+                    serviceScope.launch {
+                        if (currentSessionStatus() == Status.Started) {
+                            restartFromWatchdog("notification-action")
+                        } else if (currentSessionStatus() == Status.Stopped) {
+                            onStartCommand()
+                        }
+                    }
+                }
+
+                Action.SERVICE_RELOAD -> {
+                    val token = intent.getStringExtra(VpnCommandFence.EXTRA_TOKEN)
+                    val reload = {
+                        // Each process has its own config cache; preferences do not refresh it.
+                        if (RuntimeConfigReload.cacheReceived(intent) { SimpleConfigManager.cacheConfig(it) }) {
+                            if (intent.getBooleanExtra(Action.EXTRA_USER_INITIATED, false)) {
+                                SimpleConfigManager.setStartedByUser(true)
+                                SimpleConfigManager.setManualDisconnectRequested(false)
+                            }
+                            rememberAppCommand(token, intent.getStringExtra(HermesPilotGate.EXTRA_MANAGED_CONFIG)
+                                .takeIf { hermesBuild && token != null })
+                            serviceReload()
+                        } else {
+                            android.util.Log.w("BoxService", "Ignoring reload without a runtime config")
+                        }
+                    }
+                    if (intent.hasExtra(VpnCommandFence.EXTRA_TOKEN)) {
+                        VpnCommandFence.runCurrent(service, token, VpnCommandFence.Kind.Start, reload)
+                    } else {
+                        reload()
+                    }
+                }
+
+                Action.SERVICE_STATUS_QUERY -> {
+                    val snapshot = sessionState.snapshot()
+                    val next = currentSessionStatus(snapshot.phase)
+                    val tunReady = Settings.serviceMode != com.tecclub.flutter_singbox.constant.ServiceMode.VPN ||
+                        runCatching { fileDescriptor?.fileDescriptor?.valid() == true }.getOrDefault(false)
+                    resultCode = NativeStatusQuery.encode(
+                        if (next == Status.Started && (!snapshot.desiredRunning || !tunReady)) Status.Starting else next,
+                    )
+                    resultData = nativeConfigBinding?.forGeneration(snapshot.generation)
+                }
+
+
+                Action.SERVICE_PROTECTION_QUERY -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && service is VPNService) {
+                        resultCode = NativeProtectionQuery.PRESENT
+                        setResultExtras(android.os.Bundle().apply {
+                            service.protectionState().forEach { (key, value) -> putBoolean(key, value) }
+                            if (intent.getBooleanExtra(NativeProtectionQuery.INCLUDE_APP_ROUTING, false)) {
+                                service.appliedAppExclusions()?.let {
+                                    putStringArrayList(NativeProtectionQuery.APPLIED_EXCLUSIONS, ArrayList(it))
+                                }
+                            }
+                        })
+                    }
+                }
+
+                HermesPilotGate.ACCESS_CHANGED -> hermesLane?.accessChanged()
+                HermesPilotGate.QUEUE_CHANGED -> hermesLane?.queueChanged()
+
+                PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        serviceUpdateIdleMode()
+                    }
+                    handleNetworkWakeEvent("idle-mode")
+                }
+
+                Intent.ACTION_SCREEN_ON,
+                Intent.ACTION_USER_PRESENT -> {
+                    handleNetworkWakeEvent(intent.action ?: "network-wake")
+                }
+            }
+        }
+    }
+
+    private fun startCommandServer() {
+        if (commandServer != null) {
+            android.util.Log.d("BoxService", "Command server already started")
+            return
+        }
+        val commandServer = CommandServer(this, platformInterface)
+        commandServer.start()
+        this.commandServer = commandServer
+    }
+
+    private fun closeCommandServer(reason: String) {
+        val staleCommandServer = commandServer ?: return
+        commandServer = null
+        runCatching {
+            staleCommandServer.closeService()
+        }.onFailure {
+            android.util.Log.e("BoxService", "$reason: closeService failed", it)
+        }
+        runCatching {
+            staleCommandServer.close()
+        }.onFailure {
+            android.util.Log.e("BoxService", "$reason: command server close failed", it)
+        }
+    }
+
+    @Volatile private var lastProfileName = ""
+
+    private fun currentProfileName(): String {
+        val persistedName = SimpleConfigManager.getActiveProfileName()
+        if (persistedName.isNotBlank()) {
+            lastProfileName = persistedName
+        }
+        return lastProfileName.ifBlank { "Yurich Connect" }
+    }
+
+    private fun currentSessionStatus(phase: VpnSessionPhase = sessionState.snapshot().phase): Status = when (phase) {
+        VpnSessionPhase.Stopped,
+        VpnSessionPhase.Failed -> Status.Stopped
+        VpnSessionPhase.Starting,
+        VpnSessionPhase.Reconnecting -> Status.Starting
+        VpnSessionPhase.Connected -> Status.Started
+        VpnSessionPhase.Stopping -> Status.Stopping
+    }
+
+    private fun stampLifecyclePhase(snapshot: VpnSessionSnapshot) {
+        lifecyclePhaseStamp = LifecyclePhaseStamp(
+            generation = snapshot.generation,
+            phase = snapshot.phase,
+            startedAtElapsedMs = SystemClock.elapsedRealtime(),
+        )
+    }
+
+    private fun publishSessionStatus() {
+        val nextStatus = currentSessionStatus()
+        if (nextStatus != Status.Started) hermesLane?.invalidateRoute()
+        recordDiagnostic("session")
+        status.postValue(nextStatus)
+        broadcastStatus(nextStatus)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun installHermesLease(generation: Long) {
+        val runner = xrayRunner ?: return
+        val proof = runner.hermesProof() ?: return
+        val command = appCommandToken ?: return
+        val descriptor = fileDescriptor ?: return
+        val network = lastHealthyDefaultNetwork ?: return
+        val lease = HermesLiveRoute(generation, proof.fingerprint, command, descriptor,
+            network, hermesNetworkEpoch.get(), proof.path)
+        if (!runCatching { hermesRouteIsCurrent(lease) }.getOrDefault(false)) return
+        synchronized(hermesLaneLock) {
+            if (hermesDestroyed) return
+            val lane = hermesLane ?: HermesDeliveryLane(
+                service.applicationContext, serviceScope, ::hermesRouteIsCurrent,
+            ).also { hermesLane = it }
+            lane.install(lease)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun hermesRouteIsCurrent(lease: HermesLiveRoute): Boolean {
+        val vpn = service as? VPNService ?: return false
+        val state = sessionState.snapshot()
+        val runner = xrayRunner ?: return false
+        val currentProof = runner.hermesProof() ?: return false
+        return state.desiredRunning && state.phase == VpnSessionPhase.Connected &&
+            state.generation == lease.sessionGeneration && runner.ownsHermesRuntime(currentProof) &&
+            currentProof.fingerprint == lease.configuration &&
+            currentProof.path == lease.path && hermesNetworkEpoch.get() == lease.networkEpoch &&
+            appCommandToken == lease.command && fileDescriptor === lease.descriptor &&
+            lease.descriptor.fileDescriptor.valid() && DefaultNetworkMonitor.defaultNetwork == lease.network &&
+            physicalDefaultNetwork() == lease.network && DefaultNetworkMonitor.isValidatedPhysical(lease.network) &&
+            // A stop/reload issued by the app invalidates the old lease even
+            // before Android delivers the corresponding broadcast.
+            VpnCommandFence.isCurrentStart(service, lease.command) && vpn.hermesPolicyAllows() &&
+            sessionState.isCurrent(lease.sessionGeneration) && fileDescriptor === lease.descriptor
+    }
+
+    private fun ensureCurrentSession(
+        generation: Long,
+        requireDesiredRunning: Boolean = true,
+    ) {
+        if (!sessionState.isCurrent(generation, requireDesiredRunning)) {
+            throw CancellationException("Stale VPN session generation $generation")
+        }
+    }
+
+    private fun launchLifecycle(
+        generation: Long,
+        block: suspend () -> Unit,
+    ) {
+        lifecycleJob?.cancel()
+        lifecycleJob = serviceScope.launch {
+            lifecycleMutex.withLock {
+                ensureCurrentSession(generation)
+                block()
+            }
+        }
+    }
+
+    private fun configFingerprint(config: String): String {
+        return NativeConfigBinding.fingerprint(config)
+    }
+
+    private suspend fun startService(generation: Long) {
+        android.util.Log.e("BoxService", "Starting SingBox service...")
+        try {
+            ensureCurrentSession(generation)
+            // withContext(Dispatchers.Main) {
+            //     android.util.Log.e("BoxService", "Showing initial notification")
+            //     notification.show(lastProfileName, "Starting...")
+            // }
+
+            // Load the configuration from the SimpleConfigManager instead of database
+            android.util.Log.e("BoxService", "Loading configuration from SimpleConfigManager")
+            val content = SimpleConfigManager.getConfig()
+            diagnosticProtocol = runCatching {
+                val root = org.json.JSONObject(content)
+                val config = root.optJSONObject("xray") ?: root
+                val outbounds = config.optJSONArray("outbounds")
+                var protocol = "unknown"
+                if (outbounds != null) for (index in 0 until outbounds.length()) {
+                    val outbound = outbounds.optJSONObject(index) ?: continue
+                    val type = outbound.optString("type", outbound.optString("protocol"))
+                    if (type == "vless") {
+                        val stream = outbound.optJSONObject("streamSettings")
+                        protocol = when {
+                            stream?.optString("network") in listOf("xhttp", "splithttp") -> "xhttp"
+                            stream?.optString("security") == "reality" ||
+                                outbound.optJSONObject("tls")?.optJSONObject("reality")?.optBoolean("enabled") == true -> "reality"
+                            else -> "vless"
+                        }
+                        break
+                    }
+                    if (type in listOf("naive", "hysteria", "hysteria2", "socks")) { protocol = type; break }
+                }
+                protocol
+            }.getOrDefault("unknown")
+            android.util.Log.e("BoxService", "Config loaded, length: ${content.length}")
+            watchdogMixedProxyEnabled = SingBoxRuntimeConfig.exposesMixedProxy(
+                content,
+                WATCHDOG_MIXED_PROXY_PORT,
+            )
+            val fingerprint = configFingerprint(content)
+            lastConfigFingerprint = fingerprint
+            nativeConfigBinding = NativeConfigBinding(generation, fingerprint)
+            networkResetTracker.markCurrent(physicalDefaultNetwork())
+            
+            if (content.isBlank() || content == "{}") {
+                android.util.Log.e("BoxService", "Empty configuration detected")
+                stopAndAlert(Alert.EmptyConfiguration, generation = generation)
+                return
+            }
+
+            // Keep requested fingerprint for Flutter's generation-bound ACK.
+            // Only the effective config goes into a core. Every start, reload,
+            // clean-process/sticky/package restore passes through this boundary.
+            val runtimePlan = (service as? VPNService)?.prepareRuntime(content)
+            if (runtimePlan != null) (service as VPNService).useRuntimePlan(runtimePlan, fingerprint)
+            val effectiveContent = runtimePlan?.content ?: content
+            val xrayConfig = XrayRuntimeConfig.from(effectiveContent)
+            if (xrayConfig.enabled) {
+                val hasPilotOrigin = hermesBuild && runtimePlan?.strict == false &&
+                    hermesManagedFingerprint == fingerprint && appCommandToken != null &&
+                    // The Xray bootstrap can resolve only the selected proxy.
+                    // Never let it resolve the incident destination itself.
+                    com.tecclub.flutter_singbox.xray.hermesXrayRoute.canBootstrap(xrayConfig.configJson)
+                startXrayService(xrayConfig, generation, hasPilotOrigin)
+                return
+            }
+            activeRuntimeCore = VpnRuntimeCore.SingBox
+            processRuntimeCore = VpnRuntimeCore.SingBox
+            processUsedHysteria2 = processUsedHysteria2 || SingBoxRuntimeConfig.usesHysteria2(effectiveContent)
+
+            Application.ensureLibboxInitialized(service.applicationContext)
+            verifyNativeRuntimeIsolation(VpnRuntimeCore.SingBox)
+            startCommandServer()
+            val activeCommandServer = checkNotNull(commandServer) {
+                "Command server is unavailable after initialization"
+            }
+
+            lastProfileName = SimpleConfigManager.getActiveProfileName()
+                .ifBlank { "Yurich Connect" }
+            // withContext(Dispatchers.Main) {
+            //     android.util.Log.e("BoxService", "Updating notification with profile name")
+            //     // notification.show(lastProfileName, "Starting...")
+            // }
+
+            android.util.Log.e("BoxService", "Starting DefaultNetworkMonitor")
+            DefaultNetworkMonitor.setNetworkChangeObserver(::handleDefaultNetworkTransition)
+            DefaultNetworkMonitor.start()
+            
+            android.util.Log.e("BoxService", "Setting memory limit")
+            Libbox.setMemoryLimit(true)
+            
+            android.util.Log.e("BoxService", "Config accepted, length: ${content.length}")
+
+            try {
+                activeCommandServer.startOrReloadService(effectiveContent, OverrideOptions())
+                android.util.Log.e("BoxService", "SingBox service started successfully")
+            } catch (e: Exception) {
+                android.util.Log.e("BoxService", "Failed to start SingBox service: ${e.message}", e)
+                stopAndAlert(Alert.StartService, e.message, generation)
+                return
+            }
+
+            ensureCurrentSession(generation)
+            android.util.Log.i(
+                "BoxService",
+                "Sing-box runtime started; waiting for external tunnel readiness"
+            )
+            android.util.Log.e("BoxService", "Starting traffic monitor")
+            startTrafficMonitor()
+            startResourceGuard()
+
+            withContext(Dispatchers.Main) {
+                notification.show(currentProfileName(), "Проверка соединения...")
+            }
+            refreshKeeperWakeLock("service-start")
+            startReadinessValidation(
+                generation = generation,
+                reason = "sing-box-start",
+                initialDelayMs = READINESS_INITIAL_DELAY_MS,
+                demoteUntilReady = true,
+            )
+
+            android.util.Log.e("BoxService", "Service startup waiting for readiness")
+        } catch (e: CancellationException) {
+            android.util.Log.w("BoxService", "Cancelled stale start generation $generation")
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.e("BoxService", "Uncaught exception in startService: ${e.message}", e)
+            stopAndAlert(Alert.StartService, e.message, generation)
+            return
+        }
+    }
+
+    private suspend fun startXrayService(
+        runtimeConfig: XrayRuntimeConfig,
+        generation: Long,
+        prepareHermesRoute: Boolean,
+    ) {
+        val configJson = runtimeConfig.configJson
+        if (service !is VPNService) {
+            stopAndAlert(
+                Alert.StartService,
+                "Xray runtime requires Android VPN service",
+                generation,
+            )
+            return
+        }
+
+        try {
+            ensureCurrentSession(generation)
+            activeRuntimeCore = VpnRuntimeCore.Xray
+            processRuntimeCore = VpnRuntimeCore.Xray
+            android.util.Log.e("BoxService", "Starting Xray service...")
+            lastProfileName = SimpleConfigManager.getActiveProfileName()
+                .ifBlank { "Yurich Connect XHTTP" }
+            watchdogMixedProxyEnabled = XrayRuntimeConfig.exposesHttpProxy(
+                configJson,
+                WATCHDOG_MIXED_PROXY_PORT,
+            )
+            DefaultNetworkMonitor.setNetworkChangeObserver(::handleDefaultNetworkTransition)
+            DefaultNetworkMonitor.start()
+            // Android's default resolver can point back into our own TUN.
+            // Resolve only the upstream on the physical network; keep requested
+            // config/fingerprint and TLS/HTTP identities unchanged.
+            val bootstrapConfig = com.tecclub.flutter_singbox.xray.XrayBootstrapResolver.resolve(service, configJson)
+            ensureCurrentSession(generation)
+            val runner = XrayRunner(service)
+            xrayRunner = runner
+            val response = withContext(Dispatchers.IO) {
+                runner.start(
+                    bootstrapConfig,
+                    runtimeConfig.androidDisallowedPackages,
+                    prepareHermesRoute = prepareHermesRoute,
+                )
+            }
+            verifyNativeRuntimeIsolation(VpnRuntimeCore.Xray)
+            android.util.Log.e("BoxService", "Xray service started: $response")
+            startResourceGuard()
+
+            ensureCurrentSession(generation)
+            withContext(Dispatchers.Main) {
+                notification.show(currentProfileName(), "Проверка соединения...")
+            }
+            refreshKeeperWakeLock("xray-service-start")
+            startReadinessValidation(
+                generation = generation,
+                reason = "xray-start",
+                initialDelayMs = READINESS_INITIAL_DELAY_MS,
+                demoteUntilReady = true,
+            )
+        } catch (e: CancellationException) {
+            android.util.Log.w("BoxService", "Cancelled stale Xray start generation $generation")
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.e("BoxService", "Failed to start Xray service: ${e.message}", e)
+            stopXrayRunner("startXrayService")
+            stopAndAlert(Alert.StartService, e.message, generation)
+        }
+    }
+
+    override fun serviceReload() {
+        val reconnect = sessionState.requestReconnect("service-reload") ?: return
+        stampLifecyclePhase(reconnect)
+        publishSessionStatus()
+        launchLifecycle(reconnect.generation) {
+            recycleVpnService("service-reload", reconnect.generation)
+        }
+    }
+
+    private suspend fun recycleVpnService(
+        reason: String,
+        generation: Long,
+        incomingRuntimeCore: VpnRuntimeCore? = null,
+    ) {
+        ensureCurrentSession(generation)
+        val incomingConfig = runCatching { SimpleConfigManager.getConfig() }.getOrDefault("{}")
+        val targetRuntimeCore = incomingRuntimeCore ?: VpnRuntimeCorePolicy.classify(incomingConfig)
+        val previousRuntimeCore = processRuntimeCore ?: activeRuntimeCore
+        val watchdogRecovery = reason.startsWith("watchdog:")
+        if (
+            watchdogRecovery ||
+            VpnRuntimeCorePolicy.requiresCleanProcess(
+                previousRuntimeCore, targetRuntimeCore,
+                previousUsedHysteria2 = processUsedHysteria2,
+                incomingUsesHysteria2 = SingBoxRuntimeConfig.usesHysteria2(incomingConfig),
+            )
+        ) {
+            // A watchdog can be recovering a blocked Go/JNI runtime. Graceful
+            // in-process teardown is not cancellable once JNI blocks and would
+            // hold lifecycleMutex forever, so use the isolated-process escape
+            // hatch for confirmed health recovery. Routine same-core config
+            // switches without Hysteria2 still recycle in-process. QUIC config
+            // switches use a fresh process after reproduced same-process stalls.
+            withContext(Dispatchers.Main) {
+                restartInCleanProcess(
+                    "$reason:${previousRuntimeCore?.name}->${targetRuntimeCore.name}",
+                )
+            }
+            return
+        }
+
+        restartRuntimeInProcess(reason, generation, targetRuntimeCore)
+    }
+
+    private suspend fun restartRuntimeInProcess(
+        reason: String,
+        generation: Long,
+        targetRuntimeCore: VpnRuntimeCore,
+    ) {
+        ensureCurrentSession(generation)
+        android.util.Log.w(
+            "BoxService",
+            "Recycling ${targetRuntimeCore.name} runtime in the current VPN process after $reason",
+        )
+        stopNativeWatchdog(clearRestarting = false)
+        refreshKeeperWakeLock("runtime-recycle")
+        withContext(Dispatchers.Main) {
+            notification.show(currentProfileName(), "Восстановление соединения...")
+        }
+
+        stopXrayRunner("runtime recycle after $reason")
+        closeCommandServer("runtime recycle after $reason")
+        try {
+            DefaultNetworkMonitor.stop()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.e("BoxService", "$reason: network monitor stop failed", e)
+        }
+        closeTunFileDescriptor()
+        activeRuntimeCore = null
+
+        ensureCurrentSession(generation)
+        startService(generation)
+    }
+
+    override fun serviceStop() {
+        android.util.Log.d("BoxService", "Native service requested runtime stop")
+        readinessRevision.incrementAndGet()
+        readinessJob?.cancel()
+        readinessJob = null
+        stopNativeWatchdog()
+        closeTunFileDescriptor()
+        runCatching {
+            commandServer?.closeService()
+        }.onFailure {
+            android.util.Log.e("BoxService", "Native runtime stop failed", it)
+        }
+    }
+
+    override fun writeDebugMessage(message: String) {
+        android.util.Log.d("BoxService", message)
+    }
+
+    override fun getSystemProxyStatus(): SystemProxyStatus {
+        val status = SystemProxyStatus()
+        if (service is VPNService) {
+            status.available = service.systemProxyAvailable
+            status.enabled = service.systemProxyEnabled
+        }
+        return status
+    }
+
+    override fun setSystemProxyEnabled(isEnabled: Boolean) {
+        serviceReload()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun serviceUpdateIdleMode() {
+        if (isDeviceIdleMode()) {
+            if (currentSessionStatus() == Status.Started) {
+                releaseKeeperWakeLock()
+            }
+            return
+        }
+        android.util.Log.d(
+            "BoxService",
+            "Device idle mode changed; keeping foreground VPN command server awake"
+        )
+        commandServer?.wake()
+        refreshKeeperWakeLock("device-idle")
+    }
+
+    private fun startTrafficMonitor() {
+        // Nothing to do here - we're using StatusClient to get traffic updates
+        // This method is kept for backwards compatibility
+        android.util.Log.d("BoxService", "Traffic monitoring is now handled by StatusClient")
+    }
+
+    private fun closeTunFileDescriptor() {
+        hermesLane?.invalidateRoute()
+        val pfd = fileDescriptor ?: return
+        runCatching {
+            pfd.close()
+        }.onFailure {
+            android.util.Log.e("BoxService", "service: error when closing tun fd", it)
+        }
+        fileDescriptor = null
+    }
+
+    private fun hasActiveRuntime(): Boolean {
+        val xrayActive = runCatching { xrayRunner?.isStarted() == true }
+            .getOrDefault(false)
+        return xrayActive || xrayRunner != null || fileDescriptor != null ||
+            commandServer != null || lifecycleJob?.isActive == true ||
+            readinessJob?.isActive == true || cleanProcessRestartScheduled
+    }
+
+    private fun shouldRecoverStaleLifecycleState(): Boolean {
+        val snapshot = sessionState.snapshot()
+        return TunnelReadinessPolicy.isStaleLifecyclePhase(
+            nowMs = SystemClock.elapsedRealtime(),
+            currentGeneration = snapshot.generation,
+            currentPhase = snapshot.phase,
+            phaseStamp = lifecyclePhaseStamp,
+            timeoutMs = LIFECYCLE_RECOVERY_TIMEOUT_MS,
+            runtimeActive = hasActiveRuntime(),
+        )
+    }
+
+    private fun recoverStaleLifecycleState(currentStatus: Status, keepRunning: Boolean) {
+        android.util.Log.w(
+            "BoxService",
+            "Recovering stale lifecycle state: $currentStatus"
+        )
+        stopNativeWatchdog()
+        releaseKeeperWakeLock()
+        notification.stop()
+        // Never publish a synthetic Stopped while the old service/process may
+        // still be tearing down. Process exit is the authoritative boundary;
+        // the main process confirms service absence before exposing Stopped.
+        if (keepRunning) {
+            restartInCleanProcess("stale-lifecycle:$currentStatus")
+        } else {
+            service.stopSelf()
+        }
+    }
+
+    private fun stopXrayRunner(reason: String) {
+        val runner = xrayRunner ?: return
+        xrayRunner = null
+        // Xray/libXray can block while reading from TUN. Close the fd first so Android
+        // releases the VPN network promptly and stopXray() can exit its read loop.
+        closeTunFileDescriptor()
+        runCatching {
+            runner.stop()
+        }.onFailure {
+            android.util.Log.e("BoxService", "$reason: error when stopping xray", it)
+        }
+    }
+
+    private fun stopService() {
+        val currentStatus = currentSessionStatus()
+        if (currentStatus != Status.Started && currentStatus != Status.Starting) return
+        val stop = sessionState.requestStop("service-close")
+        stampLifecyclePhase(stop)
+        publishSessionStatus()
+        lifecycleJob?.cancel()
+        stopNativeWatchdog()
+        releaseKeeperWakeLock()
+        runCatching {
+            SimpleConfigManager.setStartedByUser(false)
+        }
+        if (receiverRegistered) {
+            service.unregisterReceiver(receiver)
+            receiverRegistered = false
+        }
+        notification.stop()
+        lifecycleJob = serviceScope.launch {
+            lifecycleMutex.withLock {
+                ensureCurrentSession(stop.generation, requireDesiredRunning = false)
+                stopXrayRunner("stopService")
+                runCatching {
+                    commandServer?.closeService()
+                }.onFailure {
+                    android.util.Log.e("BoxService", "service: error when closing", it)
+                }
+                try {
+                    DefaultNetworkMonitor.stop()
+                } catch (e: Exception) {
+                    android.util.Log.e("BoxService", "service: error when stopping network monitor", e)
+                }
+                closeTunFileDescriptor()
+
+                commandServer?.close()
+                commandServer = null
+                if (sessionState.markStopped(
+                        stop.generation,
+                        reason = "service-stopped",
+                        clearDesiredRunning = true,
+                    )
+                ) {
+                    stampLifecyclePhase(sessionState.snapshot())
+                    publishSessionStatus()
+                }
+                withContext(Dispatchers.Main) {
+                    service.stopSelf()
+                }
+            }
+        }
+    }
+
+    private suspend fun stopAndAlert(
+        type: Alert,
+        message: String? = null,
+        generation: Long = sessionState.snapshot().generation,
+    ) {
+        android.util.Log.e("BoxService", "stopAndAlert called: ${type.name}, message: $message")
+        recordDiagnostic("alert", mapOf("reason" to type.ordinal.toLong()))
+        if (!sessionState.markFailed(
+                generation,
+                reason = "${type.name}:${message.orEmpty()}",
+                keepDesiredRunning = false,
+            )
+        ) {
+            android.util.Log.w("BoxService", "Ignoring alert from stale generation $generation")
+            return
+        }
+        stampLifecyclePhase(sessionState.snapshot())
+        publishSessionStatus()
+        stopNativeWatchdog()
+        releaseKeeperWakeLock()
+        runCatching {
+            SimpleConfigManager.setStartedByUser(false)
+        }
+        stopXrayRunner("stopAndAlert")
+        runCatching {
+            commandServer?.closeService()
+        }.onFailure {
+            android.util.Log.e("BoxService", "stopAndAlert: error when closing sing-box", it)
+        }
+        try {
+            DefaultNetworkMonitor.stop()
+        } catch (e: Exception) {
+            android.util.Log.e("BoxService", "stopAndAlert: error when stopping network monitor", e)
+        }
+        closeTunFileDescriptor()
+        runCatching {
+            commandServer?.close()
+            commandServer = null
+        }.onFailure {
+            android.util.Log.e("BoxService", "stopAndAlert: error when closing command server", it)
+        }
+        withContext(Dispatchers.Main) {
+            // CRITICAL: Must call startForeground before stopping to avoid Android crash
+            // When startForegroundService is called, we MUST call startForeground within ~5 seconds
+            android.util.Log.e("BoxService", "Showing error notification before stopping")
+            notification.show("Error", message ?: type.name)
+            
+            if (receiverRegistered) {
+                android.util.Log.e("BoxService", "Unregistering broadcast receivers")
+                service.unregisterReceiver(receiver)
+                receiverRegistered = false
+            }
+            
+            android.util.Log.e("BoxService", "Stopping notification")
+            notification.stop()
+            
+            android.util.Log.e("BoxService", "Broadcasting alert: ${type.name}")
+            binder.broadcast { serviceCallback ->
+                serviceCallback.onServiceAlert(type.ordinal, message)
+            }
+            
+            // Stop the service itself
+            android.util.Log.e("BoxService", "Stopping service")
+            service.stopSelf()
+            
+            android.util.Log.e("BoxService", "Alert handling complete")
+        }
+    }
+
+    @Suppress("SameReturnValue")
+    internal fun onStartCommand(): Int {
+        if (!diagnosticProcessAnnounced) {
+            diagnosticProcessAnnounced = true
+            recordDiagnostic("process")
+        }
+        Application.initializeBaseIfNeeded(service.applicationContext)
+        val currentStatus = currentSessionStatus()
+        android.util.Log.e("BoxService", "onStartCommand called, current status: $currentStatus")
+        val keepRunning = runCatching { SimpleConfigManager.getStartedByUser() }.getOrDefault(false)
+        val incomingConfig = runCatching { SimpleConfigManager.getConfig() }.getOrDefault("{}")
+        val incomingFingerprint = runCatching {
+            configFingerprint(incomingConfig)
+        }.getOrDefault("")
+        val incomingRuntimeCore = VpnRuntimeCorePolicy.classify(incomingConfig)
+
+        if (
+            currentStatus == Status.Stopped &&
+            VpnRuntimeCorePolicy.requiresCleanProcess(
+                previous = processRuntimeCore,
+                incoming = incomingRuntimeCore,
+                previousUsedHysteria2 = processUsedHysteria2,
+                incomingUsesHysteria2 = SingBoxRuntimeConfig.usesHysteria2(incomingConfig),
+            )
+        ) {
+            restartInCleanProcess(
+                "stopped-runtime-switch:${processRuntimeCore?.name}->${incomingRuntimeCore.name}",
+            )
+            return Service.START_NOT_STICKY
+        }
+
+        if (currentStatus != Status.Stopped) {
+            if (shouldRecoverStaleLifecycleState()) {
+                recoverStaleLifecycleState(currentStatus, keepRunning)
+                return if (keepRunning) Service.START_STICKY else Service.START_NOT_STICKY
+            } else {
+                val policyChanged = (service as? VPNService)?.needsRuntimePolicyUpdate() == true
+                val hasConfigChange = policyChanged || lastConfigFingerprint != null &&
+                    !incomingConfig.isBlank() &&
+                    incomingConfig != "{}" &&
+                    incomingFingerprint.isNotEmpty() &&
+                    incomingFingerprint != (lastConfigFingerprint ?: "")
+
+                if (hasConfigChange) {
+                    val reconnect = sessionState.requestReconnect("runtime-config-switch")
+                        ?: return if (keepRunning) {
+                            Service.START_STICKY
+                        } else {
+                            Service.START_NOT_STICKY
+                        }
+                    stampLifecyclePhase(reconnect)
+                    publishSessionStatus()
+                    launchLifecycle(reconnect.generation) {
+                        recycleVpnService(
+                            reason = "runtime-config-switch",
+                            generation = reconnect.generation,
+                            incomingRuntimeCore = incomingRuntimeCore,
+                        )
+                    }
+                    return if (keepRunning) Service.START_STICKY else Service.START_NOT_STICKY
+                } else {
+                    android.util.Log.e("BoxService", "Service already running, reusing config")
+                    val notificationTitle = currentProfileName()
+                    val notificationText = if (currentStatus == Status.Started) {
+                        "Подключено"
+                    } else {
+                        "Подключение..."
+                    }
+                    notification.show(notificationTitle, notificationText)
+                    ensureReceiversRegistered()
+                    refreshRunningService("on-start-command-existing")
+                }
+                return if (keepRunning) Service.START_STICKY else Service.START_NOT_STICKY
+            }
+        }
+
+        // CRITICAL: Call startForeground IMMEDIATELY to prevent Android from killing the app
+        // This must happen synchronously before any async work
+        android.util.Log.e("BoxService", "Starting foreground notification immediately")
+        notification.show("Yurich Connect", "Подключение...")
+
+        android.util.Log.e("BoxService", "Setting status to Starting")
+        val start = sessionState.requestStart("on-start-command")
+        stampLifecyclePhase(start)
+        publishSessionStatus()
+
+        ensureReceiversRegistered()
+
+        android.util.Log.e("BoxService", "Launching IO coroutine for service startup")
+        launchLifecycle(start.generation) {
+            try {
+                val runtimeConfig = XrayRuntimeConfig.from(SimpleConfigManager.getConfig())
+                activeRuntimeCore = if (runtimeConfig.enabled) {
+                    VpnRuntimeCore.Xray
+                } else {
+                    VpnRuntimeCore.SingBox
+                }
+                if (runtimeConfig.enabled) {
+                    android.util.Log.e(
+                        "BoxService",
+                        "Xray config detected, skipping sing-box command server"
+                    )
+                } else {
+                    // Record the process owner before the first native library
+                    // load. If initialization fails halfway through, a later
+                    // Xray start must still force a clean VPN process instead
+                    // of loading both Go runtimes into the same process.
+                    processRuntimeCore = VpnRuntimeCore.SingBox
+                    android.util.Log.e("BoxService", "Ensuring libbox initialization")
+                    Application.ensureLibboxInitialized(service.applicationContext)
+                    verifyNativeRuntimeIsolation(VpnRuntimeCore.SingBox)
+                    android.util.Log.e("BoxService", "Starting command server")
+                    startCommandServer()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("BoxService", "Failed to start command server: ${e.message}", e)
+                stopAndAlert(Alert.StartCommandServer, e.message, start.generation)
+                return@launchLifecycle
+            }
+
+            ensureCurrentSession(start.generation)
+            android.util.Log.e("BoxService", "Calling startService()")
+            startService(start.generation)
+        }
+        return if (keepRunning) Service.START_STICKY else Service.START_NOT_STICKY
+    }
+
+    private fun restartInCleanProcess(reason: String) {
+        if (cleanProcessRestartScheduled) {
+            android.util.Log.d("BoxService", "Clean VPN process restart already scheduled")
+            return
+        }
+        cleanProcessRestartScheduled = true
+        recordDiagnostic("recycle", labels = mapOf("cause" to when {
+            reason.contains("resource-pressure") -> "resource_pressure"
+            reason.startsWith("watchdog:") -> "other"
+            else -> "core_switch"
+        }))
+        android.util.Log.w(
+            "BoxService",
+            "Restarting the VPN process cleanly after $reason",
+        )
+
+        readinessRevision.incrementAndGet()
+        readinessJob?.cancel()
+        readinessJob = null
+        stopNativeWatchdog()
+        releaseKeeperWakeLock()
+        notification.show("Yurich Connect", "Переключение протокола...")
+
+        service.sendBroadcast(
+            Intent(service, VpnProcessRestartReceiver::class.java).apply {
+                action = VpnProcessRestartReceiver.ACTION_RESTART_CLEAN_PROCESS
+                putExtra(VpnProcessRestartReceiver.EXTRA_PREVIOUS_VPN_PID, android.os.Process.myPid())
+                appCommandToken?.let { putExtra(VpnCommandFence.EXTRA_TOKEN, it) }
+            }
+        )
+        closeTunFileDescriptor()
+        // onDestroy may enter a blocked Go/JNI close path after a failed QUIC
+        // runtime. A main-looper callback would then never run, and the restart
+        // receiver would time out waiting for this process. Keep the forced exit
+        // independent from Android service teardown; the receiver still waits
+        // for the actual PID boundary before starting the replacement.
+        thread(
+            start = true,
+            isDaemon = false,
+            name = "yurich-vpn-process-exit",
+        ) {
+            try {
+                Thread.sleep(CORE_PROCESS_EXIT_DELAY_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            android.util.Log.i("BoxService", "Exiting old VPN process after $reason")
+            exitProcess(0)
+        }
+        service.stopSelf()
+    }
+
+    private fun ensureReceiversRegistered() {
+        nativeSoakObserver.register()
+        if (receiverRegistered) {
+            return
+        }
+        android.util.Log.e("BoxService", "Registering broadcast receivers")
+        ContextCompat.registerReceiver(service, receiver, IntentFilter().apply {
+            addAction(Action.SERVICE_CLOSE)
+            addAction(Action.SERVICE_RESTART)
+            addAction(Action.SERVICE_RELOAD)
+            addAction(Action.SERVICE_STATUS_QUERY)
+            addAction(Action.SERVICE_PROTECTION_QUERY)
+            if (hermesBuild) {
+                addAction(HermesPilotGate.ACCESS_CHANGED)
+                addAction(HermesPilotGate.QUEUE_CHANGED)
+            }
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+            }
+        }, ContextCompat.RECEIVER_NOT_EXPORTED)
+        receiverRegistered = true
+    }
+
+    private fun refreshRunningService(reason: String) {
+        val snapshot = sessionState.snapshot()
+        if (snapshot.phase != VpnSessionPhase.Connected) {
+            refreshKeeperWakeLock(reason)
+        }
+        commandServer?.wake()
+        if (snapshot.phase == VpnSessionPhase.Connected && watchdogJob?.isActive != true) {
+            android.util.Log.w("BoxService", "Restarting missing watchdog after $reason")
+            startNativeWatchdog()
+        } else if (
+            (snapshot.phase == VpnSessionPhase.Starting ||
+                snapshot.phase == VpnSessionPhase.Reconnecting) &&
+            readinessJob?.isActive != true &&
+            hasActiveRuntime()
+        ) {
+            android.util.Log.w("BoxService", "Restarting missing readiness check after $reason")
+            startReadinessValidation(
+                generation = snapshot.generation,
+                reason = reason,
+                initialDelayMs = READINESS_INITIAL_DELAY_MS,
+                demoteUntilReady = true,
+            )
+        }
+    }
+
+    internal fun onBind(): android.os.Binder {
+        return binder
+    }
+
+    internal fun onDestroy() {
+        synchronized(hermesLaneLock) {
+            hermesDestroyed = true
+            hermesLane?.close()
+            hermesLane = null
+        }
+        recordDiagnostic("destroy")
+        nativeSoakObserver.unregister()
+        val destroySnapshot = sessionState.snapshot()
+        val shouldRestore = runCatching {
+            destroySnapshot.desiredRunning &&
+                SimpleConfigManager.getStartedByUser() &&
+                SimpleConfigManager.hasValidConfig()
+        }.getOrDefault(false)
+        stopNativeWatchdog()
+        serviceScope.cancel()
+        releaseKeeperWakeLock()
+        runCatching {
+            if (receiverRegistered) {
+                service.unregisterReceiver(receiver)
+                receiverRegistered = false
+            }
+        }
+        runCatching {
+            notification.stop()
+        }
+        stopXrayRunner("onDestroy")
+        runCatching {
+            commandServer?.closeService()
+            commandServer?.close()
+            commandServer = null
+        }
+        DefaultNetworkMonitor.stopAsync()
+        closeTunFileDescriptor()
+        val stopped = sessionState.forceStopped(
+            "service-destroyed",
+            clearDesiredRunning = !shouldRestore,
+        )
+        stampLifecyclePhase(stopped)
+        publishSessionStatus()
+        binder.close()
+        if (shouldRestore) {
+            scheduleStickyRestart("service-destroyed")
+        }
+    }
+
+    internal fun onTaskRemoved() {
+        recordDiagnostic("task_removed")
+        android.util.Log.w(
+            "BoxService",
+            "Task removed; keeping current foreground VPN service without sticky restart"
+        )
+        ensureReceiversRegistered()
+        refreshRunningService("task-removed")
+    }
+
+    internal fun onRevoke() {
+        stopService()
+    }
+
+    internal fun writeLog(message: String) {
+        commandServer?.writeMessage(0, message)
+    }
+    
+    internal fun sendNotification(notification: io.nekohasekai.libbox.Notification) {
+        // Basic notification handling - can be extended later
+        android.util.Log.d("BoxService", "Notification: ${notification.title} - ${notification.body}")
+    }
+
+    private fun validatedHandoverPath(network: Network?): String? {
+        if (network == null || !DefaultNetworkMonitor.isValidatedPhysical(network)) return null
+        val caps = Application.connectivity.getNetworkCapabilities(network) ?: return null
+        val transport = when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            else -> return null
+        }
+        return "$transport:${network.networkHandle}"
+    }
+
+    private fun broadcastStatus(nextStatus: Status, failedReadinessPath: String? = null) {
+        val snapshot = sessionState.snapshot()
+        Application.application.sendBroadcast(
+            Intent(Action.BROADCAST_STATUS_CHANGED).apply {
+                `package` = Application.application.packageName
+                putExtra(Action.EXTRA_STATUS, nextStatus.ordinal)
+                putExtra(Action.EXTRA_CONFIG_FINGERPRINT, nativeConfigBinding?.forGeneration(snapshot.generation))
+                putExtra(Action.EXTRA_SESSION_REASON, snapshot.reason)
+                if (nextStatus == Status.Started) {
+                    validatedHandoverPath(lastHealthyDefaultNetwork)?.let {
+                        putExtra(Action.EXTRA_READY_PHYSICAL_PATH, it)
+                    }
+                }
+                failedReadinessPath?.let { putExtra(Action.EXTRA_FAILED_READINESS_PATH, it) }
+                putExtra(Action.EXTRA_DESIRED_RUNNING, snapshot.desiredRunning)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && service is VPNService) {
+                    putExtra(Action.EXTRA_SYSTEM_ALWAYS_ON, service.systemOwnsLifecycle())
+                }
+                SimpleConfigManager.getManualDisconnectRequested()?.let {
+                    putExtra(Action.EXTRA_MANUAL_DISCONNECT_REQUESTED, it)
+                }
+            }
+        )
+    }
+
+    private suspend fun markRuntimeReady(generation: Long, reason: String): Boolean {
+        ensureCurrentSession(generation)
+        val snapshot = sessionState.snapshot()
+        val wasConnected = snapshot.phase == VpnSessionPhase.Connected
+        if (!wasConnected && !sessionState.markConnected(generation, "ready:$reason")) {
+            return false
+        }
+        if (!wasConnected) {
+            stampLifecyclePhase(sessionState.snapshot())
+        }
+
+        lastHealthyDefaultNetwork = physicalDefaultNetwork()
+        networkResetTracker.markCurrent(lastHealthyDefaultNetwork)
+        if (hermesBuild && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            installHermesLease(generation)
+        }
+        watchdogFailures = 0
+        if (!wasConnected) {
+            android.util.Log.i(
+                "BoxService",
+                "Tunnel readiness confirmed after $reason; publishing Started"
+            )
+            publishSessionStatus()
+            withContext(Dispatchers.Main) {
+                notification.show(currentProfileName(), "Подключено")
+            }
+        }
+        releaseKeeperWakeLock()
+        startNativeWatchdog()
+        return true
+    }
+
+    private fun startReadinessValidation(
+        generation: Long,
+        reason: String,
+        initialDelayMs: Long,
+        demoteUntilReady: Boolean,
+        probeAttempts: Int = READINESS_PROBE_ATTEMPTS,
+    ) {
+        if (!sessionState.isCurrent(generation)) {
+            return
+        }
+
+        val snapshot = sessionState.snapshot()
+        if (!watchdogMixedProxyEnabled) {
+            serviceScope.launch {
+                stopAndAlert(
+                    Alert.StartService,
+                    "Локальная проверка VPN недоступна. Повторно подключи профиль из приложения.",
+                    generation,
+                )
+            }
+            return
+        }
+        val shouldDemote = demoteUntilReady && snapshot.phase == VpnSessionPhase.Connected
+        if (shouldDemote) {
+            if (!sessionState.markReconnecting(generation, "readiness:$reason")) {
+                return
+            }
+            stampLifecyclePhase(sessionState.snapshot())
+            publishSessionStatus()
+        }
+
+        cancelPeriodicWatchdog()
+        val revision = readinessRevision.incrementAndGet()
+        readinessJob?.cancel()
+        readinessJob = serviceScope.launch {
+            var sawDefaultNetwork = false
+            var failedCycles = 0
+            var softNetworkResetAttempted = false
+            var delayBeforeCycleMs = initialDelayMs
+            try {
+                if (demoteUntilReady || snapshot.phase != VpnSessionPhase.Connected) {
+                    withContext(Dispatchers.Main) {
+                        notification.show(currentProfileName(), "Проверка соединения...")
+                    }
+                }
+
+                while (isReadinessCurrent(generation, revision)) {
+                    delay(delayBeforeCycleMs)
+                    val cyclePath = validatedHandoverPath(physicalDefaultNetwork())
+                    var failedOnSamePath = cyclePath != null
+                    repeat(probeAttempts) { attempt ->
+                        if (!isReadinessCurrent(generation, revision)) {
+                            return@launch
+                        }
+
+                        val hasNetwork = hasDefaultNetwork()
+                        sawDefaultNetwork = sawDefaultNetwork || hasNetwork
+                        val probe = if (hasNetwork) probeMixedProxy() else null
+                        val healthy = probe?.healthy == true
+                        failedOnSamePath = failedOnSamePath && probe != null &&
+                            validatedHandoverPath(physicalDefaultNetwork()) == cyclePath
+                        if (healthy && isReadinessCurrent(generation, revision)) {
+                            markRuntimeReady(generation, reason)
+                            return@launch
+                        }
+
+                        android.util.Log.w(
+                            "BoxService",
+                            "Readiness probe failed ${attempt + 1}/$probeAttempts after $reason"
+                        )
+                        if (attempt + 1 < probeAttempts) {
+                            delay(READINESS_RETRY_DELAY_MS)
+                        }
+                    }
+
+                    if (!isReadinessCurrent(generation, revision)) {
+                        return@launch
+                    }
+                    // Offer a completed failed cycle, not a grace/backoff event.
+                    // Native remains responsible if the UI is absent or declines.
+                    if (failedCycles == 0 && failedOnSamePath && cyclePath != null &&
+                        currentSessionStatus() == Status.Starting &&
+                        sessionState.snapshot().desiredRunning) {
+                        broadcastStatus(Status.Starting, failedReadinessPath = cyclePath)
+                    }
+                    withContext(Dispatchers.Main) {
+                        notification.show(currentProfileName(), if (hasDefaultNetwork()) {
+                            "Восстановление соединения..."
+                        } else "Ожидание сети...")
+                    }
+
+                    failedCycles += 1
+                    val recoveryNetwork = captureNativeNetwork()
+                    val cellular = recoveryNetwork.physicalTransport() == "cellular"
+                    val restartConfirmationSatisfied =
+                        WatchdogRecoveryPolicy.canAttemptReadinessRestart(
+                            failedCycles = failedCycles,
+                            usesHysteria2 = diagnosticProtocol == "hysteria2",
+                            cellular = cellular,
+                        )
+                    val startupGraceElapsed =
+                        TunnelReadinessPolicy.canRestartAfterPhaseGrace(
+                            nowMs = SystemClock.elapsedRealtime(),
+                            currentGeneration = generation,
+                            currentPhase = sessionState.snapshot().phase,
+                            phaseStamp = lifecyclePhaseStamp,
+                            graceMs = READINESS_STARTUP_RESTART_GRACE_MS,
+                        )
+                    if (!startupGraceElapsed) {
+                        android.util.Log.w(
+                            "BoxService",
+                            "Watchdog: restart deferred during runtime startup grace",
+                        )
+                    }
+
+                    val shouldAttemptSoftReset =
+                        WatchdogRecoveryPolicy.shouldAttemptHysteria2CellularSoftReset(
+                            failedCycles = failedCycles,
+                            usesHysteria2 = diagnosticProtocol == "hysteria2",
+                            cellular = cellular,
+                            periodicHealthCheck = reason == "periodic-health",
+                            sawDefaultNetwork = sawDefaultNetwork,
+                            hasDefaultNetwork = hasDefaultNetwork(),
+                            // Demoting a healthy runtime stamps Reconnecting now.
+                            // That phase grace protects a full restart, not this
+                            // first soft reset of an already-established tunnel.
+                            runtimeWasReady = snapshot.phase == VpnSessionPhase.Connected,
+                            alreadyAttempted = softNetworkResetAttempted,
+                        )
+                    var softNetworkResetSucceeded = false
+                    if (shouldAttemptSoftReset) {
+                        softNetworkResetAttempted = true
+                        softNetworkResetSucceeded = attemptRuntimeNetworkResetForReadiness(
+                            generation = generation,
+                            revision = revision,
+                        )
+                    }
+                    if (!restartConfirmationSatisfied && sawDefaultNetwork) {
+                        recordDiagnostic(
+                            "recovery_deferred",
+                            numbers = mapOf("attempt" to failedCycles.toLong()),
+                            labels = mapOf(
+                                "cause" to if (softNetworkResetSucceeded) {
+                                    "network_reset"
+                                } else {
+                                    "readiness"
+                                },
+                            ),
+                        )
+                        android.util.Log.w(
+                            "BoxService",
+                            if (softNetworkResetSucceeded) {
+                                "Watchdog: Hysteria2 cellular soft recovery requested; confirming tunnel readiness"
+                            } else {
+                                "Watchdog: Hysteria2 cellular restart awaits a confirming failed cycle"
+                            },
+                        )
+                    }
+
+                    val restarted = restartConfirmationSatisfied && sawDefaultNetwork &&
+                        hasDefaultNetwork() && startupGraceElapsed &&
+                        restartFromWatchdog("readiness:$reason")
+                    if (restarted) {
+                        return@launch
+                    }
+
+                    delayBeforeCycleMs = WatchdogRecoveryPolicy.readinessRetryDelayMs(
+                        failedCycles = failedCycles,
+                        idle = isDeviceIdleMode(),
+                    )
+                }
+            } finally {
+                if (readinessRevision.get() == revision) {
+                    readinessJob = null
+                }
+            }
+        }
+    }
+
+    private fun isReadinessCurrent(generation: Long, revision: Long): Boolean {
+        return readinessRevision.get() == revision && sessionState.isCurrent(generation)
+    }
+
+    private fun cancelPeriodicWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = null
+        watchdogFailures = 0
+    }
+
+    private fun startResourceGuard() {
+        resourceGuardJob?.cancel()
+        resourceGuardJob = serviceScope.launch {
+            val guardJob = currentCoroutineContext()[Job]
+            var pressure = ResourcePressureState()
+            try {
+                while (isActive && sessionState.snapshot().desiredRunning) {
+                    delay(RESOURCE_GUARD_INTERVAL_MS)
+                    if (!hasActiveRuntime()) continue
+
+                    val fileDescriptors = runCatching {
+                        java.io.File("/proc/self/fd").list()?.size ?: -1
+                    }.getOrDefault(-1)
+                    if (fileDescriptors < 0) continue
+
+                    val previous = pressure
+                    pressure = ResourcePressurePolicy.observed(pressure, fileDescriptors)
+                    val restartRequired = ResourcePressurePolicy.shouldRestart(
+                        pressure,
+                        fileDescriptors,
+                    )
+                    if (ResourcePressurePolicy.shouldReport(fileDescriptors) &&
+                        (pressure != previous || restartRequired)
+                    ) {
+                        recordDiagnostic(
+                            "resource_pressure",
+                            numbers = mapOf(
+                                "fds" to fileDescriptors.toLong(),
+                                "attempt" to pressure.consecutiveCriticalSamples.toLong(),
+                            ),
+                            labels = mapOf("cause" to "resource_pressure"),
+                        )
+                    }
+                    if (restartRequired) {
+                        android.util.Log.e(
+                            "BoxService",
+                            "VPN runtime FD pressure confirmed; requesting clean recovery",
+                        )
+                        if (restartFromWatchdog("resource-pressure")) {
+                            return@launch
+                        }
+                    }
+                }
+            } finally {
+                if (resourceGuardJob === guardJob) {
+                    resourceGuardJob = null
+                }
+            }
+        }
+    }
+
+    private fun startNativeWatchdog() {
+        watchdogJob?.cancel()
+        watchdogFailures = 0
+
+        if (!watchdogMixedProxyEnabled) {
+            android.util.Log.d(
+                "BoxService",
+                "Native watchdog skipped: mixed proxy $WATCHDOG_MIXED_PROXY_PORT not found"
+            )
+            return
+        }
+
+        watchdogJob = serviceScope.launch {
+            delay(WATCHDOG_INITIAL_GRACE_MS)
+            while (isActive && currentSessionStatus() == Status.Started) {
+                commandServer?.wake()
+
+                if (!hasDefaultNetwork()) {
+                    watchdogFailures = 0
+                    android.util.Log.w("BoxService", "Watchdog: waiting for default network")
+                    withContext(Dispatchers.Main) {
+                        notification.show(currentProfileName(), "Ожидание сети...")
+                    }
+                    delay(15_000L)
+                    continue
+                }
+
+                if (isNetworkWakeGraceWindow()) {
+                    watchdogFailures = 0
+                    android.util.Log.d("BoxService", "Watchdog: waiting for network wake settle")
+                    delay(10_000L)
+                    continue
+                }
+
+                val probe = probeMixedProxy()
+                val repeatedDegradation = watchdogFlapDetector.record(
+                    nowMs = SystemClock.elapsedRealtime(),
+                    successfulEndpoints = probe.successfulEndpoints,
+                    totalEndpoints = probe.totalEndpoints,
+                )
+                if (repeatedDegradation) {
+                    val recoveryNetwork = captureNativeNetwork()
+                    val requiresConfirmation =
+                        WatchdogRecoveryPolicy.requiresExtendedReadinessConfirmation(
+                            usesHysteria2 = diagnosticProtocol == "hysteria2",
+                            cellular = recoveryNetwork.physicalTransport() == "cellular",
+                        )
+                    if (requiresConfirmation) {
+                        android.util.Log.w(
+                            "BoxService",
+                            "Watchdog: repeated Hysteria2 cellular degradation; confirming before restart",
+                        )
+                    } else {
+                        android.util.Log.w(
+                            "BoxService",
+                            "Watchdog: repeated degraded quorum; restarting VPN runtime"
+                        )
+                        if (restartFromWatchdog("repeated-degraded-quorum")) {
+                            return@launch
+                        }
+                    }
+                }
+
+                val healthy = probe.healthy
+                if (healthy) {
+                    if (watchdogFailures > 0) {
+                        android.util.Log.d("BoxService", "Watchdog: tunnel recovered")
+                    }
+                    watchdogFailures = 0
+                } else {
+                    watchdogFailures += 1
+                    android.util.Log.w(
+                        "BoxService",
+                        "Watchdog: tunnel probe failed #$watchdogFailures"
+                    )
+                    val snapshot = sessionState.snapshot()
+                    startReadinessValidation(
+                        generation = snapshot.generation,
+                        reason = "periodic-health",
+                        initialDelayMs = READINESS_RETRY_DELAY_MS,
+                        demoteUntilReady = true,
+                    )
+                    return@launch
+                }
+
+                delay(watchdogDelayMs())
+            }
+        }
+    }
+
+    private fun stopNativeWatchdog(clearRestarting: Boolean = true) {
+        cancelPeriodicWatchdog()
+        resourceGuardJob?.cancel()
+        resourceGuardJob = null
+        networkResetJob?.cancel()
+        networkResetJob = null
+        readinessRevision.incrementAndGet()
+        readinessJob?.cancel()
+        readinessJob = null
+        if (clearRestarting) {
+            watchdogRestarting = false
+        }
+        lastHealthyDefaultNetwork = null
+        networkResetTracker.clear()
+        watchdogFlapDetector.reset()
+    }
+
+    private fun handleDefaultNetworkTransition(network: Network?, transition: DefaultNetworkTransition) {
+        if (transition == DefaultNetworkTransition.Changed) {
+            if (hermesBuild) {
+                hermesNetworkEpoch.incrementAndGet()
+                hermesLane?.invalidateRoute()
+            }
+            handleNetworkWakeEvent("default-network")
+            return
+        }
+        // Android may validate the new physical network after the first
+        // delayed rebind already returned. Deliver this edge without treating
+        // every capability callback as a fresh handover.
+        val expectedNetwork = network ?: return
+        val snapshot = sessionState.snapshot()
+        if (!TunnelReadinessPolicy.canHandleNetworkEvent(
+                phase = snapshot.phase,
+                desiredRunning = snapshot.desiredRunning,
+                runtimeActive = hasActiveRuntime(),
+                restarting = watchdogRestarting,
+            ) ||
+            physicalDefaultNetwork() != expectedNetwork ||
+            !DefaultNetworkMonitor.isValidatedPhysical(expectedNetwork) ||
+            !sessionState.isCurrent(snapshot.generation)
+        ) return
+
+        if (networkResetTracker.hasRecoveryAllowance() &&
+            XrayNetworkChangePolicy.shouldRebind(
+                activeRuntimeCore, snapshot.phase, snapshot.reason,
+                networkChanged = true, networkAvailable = true, desiredRunning = snapshot.desiredRunning,
+            )
+        ) {
+            // The delayed job still checks the generation, the live network
+            // and consumes the existing one-rebind allowance.
+            scheduleXrayNetworkRebind(expectedNetwork, snapshot.generation)
+            return
+        }
+
+        commandServer?.wake()
+        if (snapshot.phase != VpnSessionPhase.Reconnecting ||
+            !snapshot.reason.startsWith("readiness:default-network") ||
+            !sessionState.isCurrent(snapshot.generation)
+        ) return
+        // The existing same-profile readiness loop may be asleep in retry
+        // backoff from an unusable path. Replace it, not the runtime; keep
+        // the ordinary HTTPS quorum, deadlines and number of attempts.
+        startReadinessValidation(
+            generation = snapshot.generation,
+            reason = "default-network-validated",
+            initialDelayMs = NETWORK_RESET_DELAY_MS,
+            demoteUntilReady = true,
+        )
+    }
+
+    private fun handleNetworkWakeEvent(reason: String) {
+        recordDiagnostic("network", labels = mapOf("source" to when (reason) {
+            "default-network" -> "default_network"
+            "idle-mode" -> "idle_mode"
+            Intent.ACTION_SCREEN_ON -> "screen_on"
+            Intent.ACTION_USER_PRESENT -> "user_present"
+            else -> "other"
+        }))
+        val snapshot = sessionState.snapshot()
+        if (!TunnelReadinessPolicy.canHandleNetworkEvent(
+                phase = snapshot.phase,
+                desiredRunning = snapshot.desiredRunning,
+                runtimeActive = hasActiveRuntime(),
+                restarting = watchdogRestarting,
+            ) || (reason == "idle-mode" && isDeviceIdleMode())) {
+            return
+        }
+
+        val currentDefaultNetwork = physicalDefaultNetwork()
+        val isDefaultNetworkEvent = reason.contains("default-network", ignoreCase = true)
+        // A wake event can be the first observation after a missed callback.
+        // Atomically detect the physical transition before duplicate/debounce
+        // checks; otherwise they can remember a new network without resetting it.
+        val transition = networkResetTracker.observeNetwork(currentDefaultNetwork)
+        val networkChanged = transition.changed
+        if (hermesBuild && networkChanged && !isDefaultNetworkEvent) {
+            hermesNetworkEpoch.incrementAndGet()
+            hermesLane?.invalidateRoute()
+        }
+        val shouldResetRuntimeNetwork = transition.resetRuntime
+        if (networkChanged) {
+            watchdogFlapDetector.reset()
+        }
+        if (isDefaultNetworkEvent && !networkChanged && readinessJob?.isActive == true) {
+            android.util.Log.d(
+                "BoxService",
+                "Watchdog: duplicate default-network callback while readiness is active",
+            )
+            commandServer?.wake()
+            return
+        }
+        val alreadyValidating = snapshot.phase == VpnSessionPhase.Reconnecting ||
+            snapshot.phase == VpnSessionPhase.Starting
+        val now = SystemClock.elapsedRealtime()
+        if (TunnelReadinessPolicy.shouldDebounceNetworkEvent(
+                elapsedSinceLastEventMs = now - lastNetworkWakeEventAt,
+                debounceMs = NETWORK_WAKE_DEBOUNCE_MS,
+                networkChanged = networkChanged,
+            )
+        ) {
+            android.util.Log.d("BoxService", "Watchdog: network/wake event debounced: $reason")
+            return
+        }
+        lastNetworkWakeEventAt = now
+
+        android.util.Log.d(
+            "BoxService",
+            "Watchdog: network/wake event $reason, changed=$networkChanged"
+        )
+        if (networkChanged || alreadyValidating) {
+            refreshKeeperWakeLock(reason)
+        }
+        if (shouldResetRuntimeNetwork) {
+            val network = checkNotNull(currentDefaultNetwork)
+            if (XrayNetworkChangePolicy.shouldRebind(activeRuntimeCore, snapshot.phase,
+                    snapshot.reason, networkChanged, true, snapshot.desiredRunning)) {
+                scheduleXrayNetworkRebind(network, snapshot.generation)
+            } else {
+                scheduleRuntimeNetworkReset(network, snapshot.generation)
+            }
+        }
+        commandServer?.wake()
+
+        // A changed Android default network invalidates the previous outbound
+        // readiness result even while the VPN NetworkAgent remains VALIDATED.
+        val readinessPlan = TunnelReadinessPolicy.networkChangePlan(
+            runtimeCore = activeRuntimeCore,
+            defaultInitialDelayMs = settleDelayFor(reason),
+            xrayInitialDelayMs = XRAY_NETWORK_SETTLE_DELAY_MS,
+            defaultProbeAttempts = READINESS_PROBE_ATTEMPTS,
+        )
+        startReadinessValidation(
+            generation = snapshot.generation,
+            reason = reason,
+            initialDelayMs = readinessPlan.initialDelayMs,
+            demoteUntilReady = networkChanged || alreadyValidating,
+            probeAttempts = readinessPlan.probeAttempts,
+        )
+    }
+
+    private fun scheduleXrayNetworkRebind(network: Network, generation: Long) {
+        val expectedRunner = xrayRunner ?: return
+        networkResetJob?.cancel()
+        networkResetJob = serviceScope.launch {
+            delay(NETWORK_RESET_DELAY_MS)
+            // No restart for a probe failure, duplicate callback, cold start,
+            // superseded profile, null/captive network, or manual disconnect.
+            if (!sessionState.isCurrent(generation) || xrayRunner !== expectedRunner ||
+                physicalDefaultNetwork() != network ||
+                !DefaultNetworkMonitor.isValidatedPhysical(network) ||
+                !networkResetTracker.consumeRecoveryAllowance()) return@launch
+            val reconnect = sessionState.requestReconnect("network-rebind", generation) ?: return@launch
+            stampLifecyclePhase(reconnect)
+            publishSessionStatus()
+            // Detach this job before recycle cancels the old network-reset job.
+            networkResetJob = null
+            launchLifecycle(reconnect.generation) {
+                recycleVpnService("network-rebind", reconnect.generation)
+            }
+        }
+    }
+
+    private fun scheduleRuntimeNetworkReset(network: Network, generation: Long) {
+        val expectedCommandServer = commandServer ?: return
+        networkResetJob?.cancel()
+        networkResetJob = serviceScope.launch {
+            delay(NETWORK_RESET_DELAY_MS)
+            if (!sessionState.isCurrent(generation) ||
+                physicalDefaultNetwork() != network ||
+                commandServer !== expectedCommandServer
+            ) {
+                return@launch
+            }
+
+            runCatching {
+                expectedCommandServer.resetNetwork()
+            }.onSuccess {
+                android.util.Log.i(
+                    "BoxService",
+                    "Reset sing-box connections after Android default-network change",
+                )
+            }.onFailure {
+                android.util.Log.e(
+                    "BoxService",
+                    "Unable to reset sing-box after Android network change",
+                    it,
+                )
+            }
+            runCatching { expectedCommandServer.wake() }
+                .onFailure {
+                    android.util.Log.w("BoxService", "Unable to wake sing-box after reset", it)
+                }
+        }
+    }
+
+    private fun attemptRuntimeNetworkResetForReadiness(
+        generation: Long,
+        revision: Long,
+    ): Boolean {
+        val expectedCommandServer = commandServer ?: return false
+        val expectedNetwork = physicalDefaultNetwork() ?: return false
+        if (!isReadinessCurrent(generation, revision) || !hasDefaultNetwork()) {
+            return false
+        }
+
+        val reset = runCatching { expectedCommandServer.resetNetwork() }
+        if (reset.isFailure) {
+            android.util.Log.e(
+                "BoxService",
+                "Unable to reset sing-box during Hysteria2 cellular recovery",
+                reset.exceptionOrNull(),
+            )
+            return false
+        }
+        if (!isReadinessCurrent(generation, revision) ||
+            commandServer !== expectedCommandServer ||
+            physicalDefaultNetwork() != expectedNetwork
+        ) {
+            return false
+        }
+
+        runCatching { expectedCommandServer.wake() }
+            .onFailure {
+                android.util.Log.w(
+                    "BoxService",
+                    "Unable to wake sing-box after Hysteria2 cellular soft recovery",
+                    it,
+                )
+            }
+        android.util.Log.i(
+            "BoxService",
+            "Reset sing-box connections after confirmed Hysteria2 cellular degradation",
+        )
+        return true
+    }
+
+    private suspend fun restartFromWatchdog(reason: String): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        val current = sessionState.snapshot()
+        if (reason != "notification-action" &&
+            current.phase in setOf(VpnSessionPhase.Starting, VpnSessionPhase.Reconnecting) &&
+            !TunnelReadinessPolicy.canRestartAfterPhaseGrace(
+                nowMs = now,
+                currentGeneration = current.generation,
+                currentPhase = current.phase,
+                phaseStamp = lifecyclePhaseStamp,
+                graceMs = READINESS_STARTUP_RESTART_GRACE_MS,
+            )
+        ) {
+            android.util.Log.w(
+                "BoxService",
+                "Watchdog: process restart deferred during reconnect grace",
+            )
+            return false
+        }
+        val networkRecoveryAllowance =
+            reason.contains("default-network", ignoreCase = true) &&
+                networkResetTracker.hasRecoveryAllowance()
+        val reconnect = recoveryBudgetMutex.withLock {
+            if (watchdogRestarting) return@withLock null
+            val fingerprint = nativeConfigBinding?.forGeneration(sessionState.snapshot().generation)
+                ?: return@withLock null
+            val previous = WatchdogRecoveryStore.read(service, fingerprint) ?: return@withLock null
+            if (reason != "notification-action" &&
+                !WatchdogRecoveryPolicy.canRestart(previous, now, networkRecoveryAllowance)) {
+                recordDiagnostic("recovery_deferred", mapOf("attempt" to previous.attempts.toLong(),
+                    "cooldownMs" to WatchdogRecoveryPolicy.cooldownMs(previous.attempts)))
+                android.util.Log.w("BoxService", "Watchdog: recovery deferred by persistent backoff")
+                return@withLock null
+            }
+            watchdogRestarting = true
+            val next = WatchdogRecoveryPolicy.restarted(previous, now)
+            if (!WatchdogRecoveryStore.write(service, fingerprint, next)) {
+                watchdogRestarting = false
+                return@withLock null
+            }
+            val requested = sessionState.requestReconnect("watchdog:$reason")
+            if (requested == null) {
+                WatchdogRecoveryStore.write(service, fingerprint, previous)
+                watchdogRestarting = false
+                return@withLock null
+            }
+            stampLifecyclePhase(requested)
+            requested
+        } ?: return false
+        if (networkRecoveryAllowance) {
+            networkResetTracker.consumeRecoveryAllowance()
+        }
+        recordDiagnostic("restart", labels = mapOf("cause" to when {
+            reason.startsWith("readiness:") -> "readiness"
+            reason == "repeated-degraded-quorum" -> "degraded_quorum"
+            reason == "resource-pressure" -> "resource_pressure"
+            reason == "notification-action" -> "user_action"
+            else -> "other"
+        }))
+        publishSessionStatus()
+        try {
+            // A periodic watchdog recovery runs inside watchdogJob itself. Detach
+            // that caller before recycleVpnService stops the old watchdog so the
+            // in-process restart is not cancelled halfway through teardown.
+            val recoveryCaller = currentCoroutineContext()[Job]
+            if (watchdogJob === recoveryCaller) {
+                watchdogJob = null
+            }
+            if (readinessJob === recoveryCaller) {
+                readinessJob = null
+            }
+            if (resourceGuardJob === recoveryCaller) {
+                resourceGuardJob = null
+            }
+            lifecycleMutex.withLock {
+                ensureCurrentSession(reconnect.generation)
+                android.util.Log.w("BoxService", "Watchdog: restarting VPN runtime after $reason")
+                refreshKeeperWakeLock("watchdog-restart")
+                withContext(Dispatchers.Main) {
+                    notification.show(currentProfileName(), "Восстановление соединения...")
+                }
+                recycleVpnService("watchdog:$reason", reconnect.generation)
+            }
+        } catch (e: CancellationException) {
+            android.util.Log.w("BoxService", "Watchdog restart cancelled for stale generation")
+            throw e
+        } finally {
+            watchdogRestarting = false
+        }
+        return true
+    }
+
+    private data class TunnelProbeResult(
+        val successfulEndpoints: Int,
+        val totalEndpoints: Int,
+    ) {
+        val healthy: Boolean
+            get() = TunnelReadinessPolicy.isHealthy(
+                successfulEndpoints = successfulEndpoints,
+                totalEndpoints = totalEndpoints,
+            )
+    }
+
+    private data class ProbeDiagnosticContext(
+        val probeId: Long,
+        val generation: Long,
+        val revision: Long,
+        val network: NativeNetworkSnapshot,
+    )
+
+    private suspend fun probeMixedProxy(): TunnelProbeResult =
+        readinessProbeCoordinator.run { probeId ->
+            withReadinessWakeLock {
+                probeMixedProxy(probeId)
+            }
+        }
+
+    private suspend fun probeMixedProxy(probeId: Long): TunnelProbeResult {
+        val probeStarted = SystemClock.elapsedRealtime()
+        val context = ProbeDiagnosticContext(
+            probeId = probeId,
+            generation = sessionState.snapshot().generation,
+            revision = readinessRevision.get(),
+            network = captureNativeNetwork(),
+        )
+        val targets = arrayOf(
+            "www.cloudflare.com" to "/cdn-cgi/trace",
+            "connectivitycheck.gstatic.com" to "/generate_204",
+            "www.google.com" to "/generate_204",
+        )
+        val quorum = runReadinessQuorum(
+            total = targets.size,
+            required = 2,
+            deadlineMs = READINESS_QUORUM_DEADLINE_MS,
+        ) { index ->
+            val (host, path) = targets[index]
+            probeMixedProxyEndpoint(host, path, context)
+        }
+        val result = TunnelProbeResult(
+            successfulEndpoints = quorum.successes,
+            totalEndpoints = targets.size,
+        )
+        val current = isReadinessCurrent(context.generation, context.revision)
+        if (current) {
+            nativeConfigBinding?.forGeneration(context.generation)?.let { fingerprint ->
+                WatchdogRecoveryStore.observe(service, fingerprint, SystemClock.elapsedRealtime(), result.healthy)
+            }
+        }
+        recordDiagnostic("quorum", mapOf("success" to quorum.successes.toLong(),
+            "total" to targets.size.toLong(), "durationMs" to SystemClock.elapsedRealtime() - probeStarted,
+            "generation" to context.generation, "revision" to context.revision,
+            "probeId" to context.probeId, "completed" to quorum.completed.toLong(),
+            "deadlineExceeded" to if (quorum.deadlineExceeded) 1L else 0L,
+            "activeNet" to context.network.activeFlags.toLong(),
+            "trackedNet" to context.network.trackedFlags.toLong(),
+            "sameNet" to context.network.sameNetwork.toLong(),
+            "current" to if (current) 1L else 0L),
+            mapOf("transport" to context.network.physicalTransport()))
+        android.util.Log.d(
+            "BoxService",
+            "External readiness quorum: ${quorum.successes}/${targets.size}, healthy=${result.healthy}"
+        )
+        return result
+    }
+
+    private suspend fun <T> withReadinessWakeLock(block: suspend () -> T): T {
+        val wakeLock = try {
+            val powerManager = service.getSystemService(Context.POWER_SERVICE) as PowerManager
+            powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "YurichConnect:ReadinessProbe",
+            ).apply {
+                setReferenceCounted(false)
+                acquire(READINESS_PROBE_WAKE_LOCK_MS)
+            }
+        } catch (error: Exception) {
+            android.util.Log.w(
+                "BoxService",
+                "Readiness wake lock unavailable: ${error.javaClass.simpleName}",
+            )
+            null
+        }
+
+        return try {
+            block()
+        } finally {
+            if (wakeLock?.isHeld == true) {
+                runCatching { wakeLock.release() }
+            }
+        }
+    }
+
+    private suspend fun probeMixedProxyEndpoint(
+        host: String,
+        path: String,
+        context: ProbeDiagnosticContext,
+    ): Boolean {
+        val probeJob = currentCoroutineContext()[Job]
+        return withCancellableSocket { rawSocket ->
+        var tlsSocket: SSLSocket? = null
+        val diagnosticStarted = SystemClock.elapsedRealtime()
+        var diagnosticStage = NativeProbeStage.ProxyConnect
+        val trace = if (nativeSoakObserver.enabled) runCatching {
+            NativeProbeEndpoint.fromHost(host)?.let {
+                NativeHealthProbeTrace(it, context.generation, context.revision,
+                    SystemClock.elapsedRealtime(), context.network)
+            }
+        }.getOrNull() else null
+        var successful = false
+        var failure = NativeProbeFailure.None
+        try {
+            rawSocket.connect(
+                InetSocketAddress("127.0.0.1", WATCHDOG_MIXED_PROXY_PORT),
+                HEALTH_CONNECT_TIMEOUT_MS,
+            )
+            trace?.enter(NativeProbeStage.ProxyResponse, SystemClock.elapsedRealtime())
+            diagnosticStage = NativeProbeStage.ProxyResponse
+            rawSocket.soTimeout = HEALTH_PROXY_RESPONSE_TIMEOUT_MS
+            val connectRequest = "CONNECT $host:443 HTTP/1.1\r\n" +
+                "Host: $host:443\r\n" +
+                "Connection: close\r\n\r\n"
+            rawSocket.getOutputStream().write(connectRequest.toByteArray(Charsets.US_ASCII))
+            rawSocket.getOutputStream().flush()
+            val connectReader = rawSocket.getInputStream().bufferedReader(Charsets.US_ASCII)
+            val connectStatus = connectReader.readLine()
+            if (connectStatus?.contains(" 200 ") != true) {
+                failure = NativeProbeFailure.ProxyStatus
+                android.util.Log.w("BoxService", "Watchdog CONNECT status for $host: $connectStatus")
+                return@withCancellableSocket false
+            }
+            while (true) {
+                val header = connectReader.readLine() ?: break
+                if (header.isEmpty()) break
+            }
+
+            trace?.enter(NativeProbeStage.Tls, SystemClock.elapsedRealtime())
+            diagnosticStage = NativeProbeStage.Tls
+            tlsSocket = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                .createSocket(rawSocket, host, 443, true) as SSLSocket
+            tlsSocket.soTimeout = HEALTH_TLS_TIMEOUT_MS
+            tlsSocket.sslParameters = tlsSocket.sslParameters.apply {
+                endpointIdentificationAlgorithm = "HTTPS"
+            }
+            tlsSocket.startHandshake()
+            trace?.enter(NativeProbeStage.Http, SystemClock.elapsedRealtime())
+            diagnosticStage = NativeProbeStage.Http
+            val request = "GET $path HTTP/1.1\r\n" +
+                "Host: $host\r\n" +
+                "User-Agent: YurichConnectNativeKeeper/2\r\n" +
+                "Connection: close\r\n\r\n"
+            tlsSocket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
+            tlsSocket.getOutputStream().flush()
+            val responseStatus = tlsSocket.getInputStream()
+                .bufferedReader(Charsets.US_ASCII)
+                .readLine()
+            successful = responseStatus?.startsWith("HTTP/") == true &&
+                (responseStatus.contains(" 204 ") || responseStatus.contains(" 200 "))
+            if (!successful) {
+                failure = NativeProbeFailure.HttpStatus
+                android.util.Log.w("BoxService", "Watchdog HTTPS status for $host: $responseStatus")
+            }
+            return@withCancellableSocket successful
+        } catch (e: Exception) {
+            if (e is CancellationException || probeJob?.isActive == false) {
+                failure = NativeProbeFailure.Cancelled
+                throw if (e is CancellationException) e
+                    else CancellationException("Readiness endpoint cancelled")
+            }
+            failure = when (e) {
+                is java.net.SocketTimeoutException -> NativeProbeFailure.Timeout
+                is javax.net.ssl.SSLException -> NativeProbeFailure.Tls
+                is java.io.IOException -> NativeProbeFailure.Io
+                else -> NativeProbeFailure.Other
+            }
+            android.util.Log.w("BoxService", "Watchdog probe failed for $host: ${e.message}")
+            return@withCancellableSocket false
+        } finally {
+            if (!successful) recordDiagnostic("probe_failure",
+                mapOf("durationMs" to SystemClock.elapsedRealtime() - diagnosticStarted,
+                    "probeId" to context.probeId,
+                    "generation" to context.generation,
+                    "revision" to context.revision,
+                    "activeNet" to context.network.activeFlags.toLong(),
+                    "trackedNet" to context.network.trackedFlags.toLong(),
+                    "sameNet" to context.network.sameNetwork.toLong()),
+                mapOf("endpoint" to (NativeProbeEndpoint.fromHost(host)?.code ?: "unknown"),
+                    "failure" to if (failure == NativeProbeFailure.None) "cancelled" else failure.code,
+                    "stage" to diagnosticStage.code,
+                    "transport" to context.network.physicalTransport()))
+            if (trace != null) runCatching {
+                android.util.Log.i("YurichNativeHealth", trace.finish(
+                    SystemClock.elapsedRealtime(), successful, failure,
+                ))
+            }
+            runCatching { tlsSocket?.close() }
+        }
+    }
+    }
+
+    private fun captureNativeNetwork(): NativeNetworkSnapshot =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            NativeNetworkSnapshot.capture(Application.connectivity, DefaultNetworkMonitor.defaultNetwork)
+        } else NativeNetworkSnapshot()
+
+    private fun hasDefaultNetwork(): Boolean = physicalDefaultNetwork() != null
+
+    private fun physicalDefaultNetwork(): Network? {
+        fun physical(network: Network?): Network? {
+            if (network == null) return null
+            val capabilities = runCatching {
+                Application.connectivity.getNetworkCapabilities(network)
+            }.getOrNull()
+            return network.takeIf {
+                TunnelReadinessPolicy.isPhysicalInternetNetwork(
+                    capabilitiesKnown = capabilities != null,
+                    internetCapable = capabilities?.hasCapability(
+                        NetworkCapabilities.NET_CAPABILITY_INTERNET,
+                    ) == true,
+                    vpnTransport = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true,
+                )
+            }
+        }
+        physical(DefaultNetworkMonitor.defaultNetwork)?.let { return it }
+        // activeNetwork can be our still-validated VPN when both radios are off.
+        // Never replace the monitor's physical network with that VPN interface.
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            physical(runCatching { Application.connectivity.activeNetwork }.getOrNull())
+        } else null
+    }
+
+    private fun verifyNativeRuntimeIsolation(expected: VpnRuntimeCore) {
+        val snapshot = NativeRuntimeIsolation.requireIsolated(expected)
+        if (snapshot == null) {
+            android.util.Log.w(
+                "RuntimeIsolation",
+                "RUNTIME_ISOLATION core=${expected.name} maps=unavailable",
+            )
+            return
+        }
+        android.util.Log.i(
+            "RuntimeIsolation",
+            "RUNTIME_ISOLATION core=${expected.name} " +
+                "libbox=${snapshot.libboxLoaded} " +
+                "libgojni=${snapshot.libgojniLoaded} safe=true",
+        )
+    }
+
+    private fun watchdogDelayMs(): Long {
+        return if (isDeviceIdleMode()) WATCHDOG_IDLE_INTERVAL_MS else WATCHDOG_INTERVAL_MS
+    }
+
+    private fun settleDelayFor(reason: String): Long {
+        return if (
+            reason.contains("network", ignoreCase = true) ||
+            reason.contains("idle", ignoreCase = true)
+        ) {
+            NETWORK_SETTLE_DELAY_MS
+        } else {
+            WAKE_SETTLE_DELAY_MS
+        }
+    }
+
+    private fun isNetworkWakeGraceWindow(): Boolean {
+        val lastEventAt = lastNetworkWakeEventAt
+        return lastEventAt > 0L &&
+            SystemClock.elapsedRealtime() - lastEventAt < NETWORK_WAKE_GRACE_MS
+    }
+
+    private fun isDeviceIdleMode(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return false
+        }
+        return runCatching {
+            val powerManager = service.getSystemService(Context.POWER_SERVICE) as PowerManager
+            powerManager.isDeviceIdleMode
+        }.getOrDefault(false)
+    }
+
+    private fun refreshKeeperWakeLock(reason: String) {
+        try {
+            val powerManager = service.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val wakeLock = keeperWakeLock ?: powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "YurichConnect:VpnKeeper"
+            ).apply {
+                setReferenceCounted(false)
+                keeperWakeLock = this
+            }
+
+            if (wakeLock.isHeld) {
+                runCatching { wakeLock.release() }
+            }
+            wakeLock.acquire(KEEPER_WAKE_LOCK_MS)
+            android.util.Log.d("BoxService", "Keeper wake lock refreshed: $reason")
+        } catch (e: Exception) {
+            android.util.Log.w("BoxService", "Keeper wake lock failed: ${e.message}")
+        }
+    }
+
+    private fun releaseKeeperWakeLock() {
+        val wakeLock = keeperWakeLock ?: return
+        if (wakeLock.isHeld) {
+            runCatching { wakeLock.release() }
+        }
+        keeperWakeLock = null
+    }
+
+    private fun scheduleStickyRestart(reason: String) {
+        if (stickyRestartScheduled) {
+            android.util.Log.d("BoxService", "Sticky restart already scheduled")
+            return
+        }
+        stickyRestartScheduled = true
+        val token = appCommandToken
+        android.util.Log.w("BoxService", "Scheduling sticky restart after $reason")
+        Handler(Looper.getMainLooper()).postDelayed({
+            stickyRestartScheduled = false
+            val shouldRestore = runCatching {
+                SimpleConfigManager.getStartedByUser() && SimpleConfigManager.hasValidConfig()
+            }.getOrDefault(false)
+            if (!shouldRestore) {
+                android.util.Log.w("BoxService", "Sticky restart skipped: user flag/config missing")
+                return@postDelayed
+            }
+            if (token != null && !VpnCommandFence.isCurrentStart(service, token)) return@postDelayed
+
+            val intent = Intent(service.applicationContext, Settings.serviceClass()).apply {
+                action = ACTION_START
+                token?.let { putExtra(VpnCommandFence.EXTRA_TOKEN, it) }
+                putExtra(EXTRA_CONFIG_CONTENT, SimpleConfigManager.getConfig())
+                putExtra(
+                    com.tecclub.flutter_singbox.config.RuntimeTlsPolicy.INTENT_REVISION_EXTRA,
+                    com.tecclub.flutter_singbox.config.RuntimeTlsPolicy.CURRENT_REVISION,
+                )
+            }
+            ContextCompat.startForegroundService(service.applicationContext, intent)
+        }, STICKY_RESTART_DELAY_MS)
+    }
+}
